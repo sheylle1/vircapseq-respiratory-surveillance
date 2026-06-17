@@ -40,8 +40,8 @@ Only de-identified metadata required to reproduce the analyses is included in th
 
 Analyses were performed using:
 
-* R (version X.X.X)
-* Python (version X.X)
+* R (version 4.3.3)
+* Python (version 3)
 * Genome Detective (v2.17–2.21)
 * Nextclade (v3.21.0)
 * FastQC (v0.11.2)
