@@ -6,7 +6,7 @@ This repository contains the code and de-identified metadata used for the analys
 
 ## Overview
 
-This study evaluates the implementation of the VirCapSeq-VERT hybridisation capture metagenomic sequencing assay for respiratory virus surveillance in South Africa.The repository supports reproducible research and facilitates peer review of the submitted manuscript.
+This study evaluates the implementation of the VirCapSeq-VERT hybridisation capture metagenomic sequencing assay for respiratory virus surveillance in South Africa.The repository supports reproducible research.
 
 *Note*: Materials in this repository may be updated upon final publication.
 
