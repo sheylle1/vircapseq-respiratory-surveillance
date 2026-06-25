@@ -6,8 +6,8 @@ library(ggplot2)
 
 INPUT_DIR <- "data/processed"
 OUTPUT_DIR <- "figures"
-PCR_FILE <- "All_PCR.xlsx"                # Combined PCR file
-CONTINUOUS_FILE <- "All_detections.csv"   # Combined detections file
+PCR_FILE <- "data_PCR.xlsx"                # Combined PCR file
+CONTINUOUS_FILE <- "data_detections.csv"   # Combined detections file
 
 COLOR_BLUE <- "#4575B4"   
 COLOR_RED  <- "#D73027" 

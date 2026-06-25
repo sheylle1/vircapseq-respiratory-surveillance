@@ -221,14 +221,14 @@ create_ct_figure <- function(main_data, metadata_info, output_dir) {
 output_dir <- "figures"
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
-metadata_file <- "data/processed/sequencing_reads.csv"
+metadata_file <- "data/processed/data_reads.csv"
 if (file.exists(metadata_file)) {
   metadata_info <- load_metadata(metadata_file)
 } else {
   stop("Metadata file not found: ", metadata_file)
 }
 
-main_file <- "data/processed/meta_data.csv"
+main_file <- "data/processed/data_meta.csv"
 if (file.exists(main_file)) {
   main_data <- prepare_main_data(main_file)
 } else {

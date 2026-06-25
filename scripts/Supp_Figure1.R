@@ -2,7 +2,7 @@
 library(tidyverse)
 library(ggplot2)
 
-data <- read.csv("data/processed/sequencing_reads.csv", stringsAsFactors = FALSE)
+data <- read.csv("data/processed/data_reads.csv", stringsAsFactors = FALSE)
 
 # Clean and prepare the data
 analysis_ready <- data %>%

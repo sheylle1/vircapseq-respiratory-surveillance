@@ -7,7 +7,7 @@ from matplotlib.lines import Line2D
 from pathlib import Path
 
 
-INPUT_FILE = "data/processed/precision_analysis.csv"
+INPUT_FILE = "data/processed/data_precision.csv"
 OUTPUT_DIR = "results/figures"
 OUTPUT_BASE = "Figure3"
 

@@ -9,8 +9,8 @@ library(gtable)
 
 INPUT_DIR <- "data/processed"
 OUTPUT_DIR <- "figures"
-PCR_FILE <- "All_PCR.xlsx"
-CONTINUOUS_FILE <- "All_detections.csv"
+PCR_FILE <- "data_PCR.xlsx"
+CONTINUOUS_FILE <- "data_detections.csv"
 
 COVERAGE_THRESHOLDS <- c(1, 10, 20, 50, 80, 90)
 RPM_THRESHOLDS <- c(1, 10, 100, 1000)
