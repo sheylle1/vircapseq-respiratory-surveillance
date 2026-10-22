@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 INPUT_FILE = "data/processed/data_precision.csv"
-OUTPUT_DIR = "results/figures"
+OUTPUT_DIR = "results/Figures"
 OUTPUT_BASE = "Figure3"
 
 # Coverage range colors (green = high coverage, red = zero)

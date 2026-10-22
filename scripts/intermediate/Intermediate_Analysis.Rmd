@@ -1,0 +1,3975 @@
+---
+title: ""
+author: "CERI"
+date: "2025-07-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Load libraries
+
+options(S7.methods = FALSE)
+
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(readxl)
+library(kableExtra)
+library(patchwork)
+library(pROC)
+library(RColorBrewer)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Set theme
+custom_theme <- function(base_size = 14) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      axis.title = element_text(size = 14, face = "bold"),
+      axis.text = element_text(size = 12),
+      legend.title = element_text(face = "bold"),
+      legend.position = "bottom"
+    )
+}
+
+convert_detected <- function(x) {
+  # Check if it's a numeric CT value (detected with CT)
+  if (is.character(x) && !is.na(x) && grepl("^[0-9.]+$", x)) {
+    return(as.numeric(x))  # CT value is a positive number
+  }
+  
+  # Check for text values
+  if (is.character(x)) {
+    lower_x <- str_to_lower(x)
+    if (lower_x == "detected") {
+      return(1)  # Detected but no CT value
+    } else if (lower_x == "not detected") {
+      return(0)  # Not detected
+    } else if (lower_x == "unknown" || is.na(x)) {
+      return(NA_real_)  # Not tested (now "NA")
+    }
+  }
+  
+  # If already numeric (shouldn't happen with new format, but just in case)
+  if (is.numeric(x)) {
+    return(x)
+  }
+  
+  # Default
+  return(NA_real_)
+}
+
+process_pcr_file_with_ct <- function(pcr_file, dataset_name) {
+  # Read the PCR file
+  pcr_raw <- read_excel(pcr_file)
+  
+  # Get all pathogen columns (everything except sample_id)
+  pathogen_cols <- setdiff(names(pcr_raw), "sample_id")
+  
+  # Process each column
+  result_list <- list()
+  
+  for (col in pathogen_cols) {
+    col_data <- pcr_raw[[col]]
+    
+    for (i in seq_along(col_data)) {
+      sample_id <- pcr_raw$sample_id[i]
+      value <- col_data[i]
+      
+      # Determine PCR result and CT value
+      if (is.character(value) && !is.na(value)) {
+        lower_val <- str_to_lower(value)
+        
+        if (lower_val == "detected") {
+          # Detected but no CT value
+          result_list[[length(result_list) + 1]] <- data.frame(
+            sample_id = sample_id,
+            Pathogen = col,
+            PCR_Result = 1,
+            ct_values = NA_real_,
+            stringsAsFactors = FALSE
+          )
+        } else if (lower_val == "not detected") {
+          result_list[[length(result_list) + 1]] <- data.frame(
+            sample_id = sample_id,
+            Pathogen = col,
+            PCR_Result = 0,
+            ct_values = NA_real_,
+            stringsAsFactors = FALSE
+          )
+        } else if (lower_val == "unknown" || is.na(value)) {
+          result_list[[length(result_list) + 1]] <- data.frame(
+            sample_id = sample_id,
+            Pathogen = col,
+            PCR_Result = NA_real_,
+            ct_values = NA_real_,
+            stringsAsFactors = FALSE
+          )
+        } else if (grepl("^[0-9.]+$", lower_val)) {
+          # This is a CT value (detected with CT)
+          ct_val <- as.numeric(lower_val)
+          result_list[[length(result_list) + 1]] <- data.frame(
+            sample_id = sample_id,
+            Pathogen = col,
+            PCR_Result = 1,  # Positive
+            ct_values = ct_val,
+            stringsAsFactors = FALSE
+          )
+        }
+      } else if (is.numeric(value) && !is.na(value)) {
+        # This is a CT value (numeric)
+        result_list[[length(result_list) + 1]] <- data.frame(
+          sample_id = sample_id,
+          Pathogen = col,
+          PCR_Result = 1,  # Positive
+          ct_values = value,
+          stringsAsFactors = FALSE
+        )
+      } else if (is.na(value)) {
+        result_list[[length(result_list) + 1]] <- data.frame(
+          sample_id = sample_id,
+          Pathogen = col,
+          PCR_Result = NA_real_,
+          ct_values = NA_real_,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+  }
+  
+  # Combine all results
+  result_df <- bind_rows(result_list) %>%
+    mutate(original_dataset = dataset_name)
+  
+  return(result_df)
+}
+```
+
+```{r parameters, echo=FALSE}
+
+# Set default parameters - these can be changed by users
+coverage_threshold <- 10
+rpm_threshold <- 10
+```
+
+
+```{r, echo=FALSE}
+
+datasets <- list(
+  list(
+    name = "PathCare",
+    description = "Pathcare Dataset",
+    pcr_file = "./Path_PCR.xlsx",
+    continuous_file = "./Pathcare_detections.csv"
+  ),
+  list(
+    name = "NHLS_GS",
+    description = "NHLS Groote Schuur",
+    pcr_file = "./NHLS_GS_UP_PCR.xlsx",
+    continuous_file = "./NHLS_GS_UP_detections.csv"
+  ),
+  list(
+    name = "NHLS_TY",
+    description = "NHLS Tygerberg",
+    pcr_file = "./NHLS_TY_PCR.xlsx",
+    continuous_file = "./NHLS_TY_detections.csv"
+  ),
+  list(
+    name = "Mucokids",
+    description = "Muco-kids",
+    pcr_file = "./Muco_PCR.xlsx",
+    continuous_file = "./Mucokids_detections.csv"
+  ),
+  list(
+    name = "SUDI",
+    description = "SUDI",
+    pcr_file = "./SUDI_PCR.xlsx",
+    continuous_file = "./SUDI_detections.csv"
+  ),
+  list(
+    name = "ALL_COMBINED",
+    description = "COMBINED dataset - All datasets merged together",
+    pcr_file = NULL,  # Will be created programmatically
+    continuous_file = NULL  # Will be created programmatically
+  )
+)
+
+# Modified prepare_dataset function with combination logic for ALL datasets
+prepare_dataset <- function(dataset_config) {
+  
+  # Check if this is a combined dataset
+  if (dataset_config$name == "ALL_COMBINED") {
+    
+    pcr_list <- list()
+    continuous_list <- list()
+    
+    # List of individual dataset names (excluding ALL_COMBINED itself)
+    individual_datasets <- c("PathCare", "NHLS_GS", "NHLS_TY", "Mucokids", "SUDI")
+    
+    for (ds_name in individual_datasets) {
+      # Find the dataset configuration
+      ds_config <- list(
+        name = ds_name,
+        pcr_file = datasets[[which(sapply(datasets, function(x) x$name == ds_name))]]$pcr_file,
+        continuous_file = datasets[[which(sapply(datasets, function(x) x$name == ds_name))]]$continuous_file
+      )
+      
+      # Process PCR file with CT values
+      pcr_list[[ds_name]] <- process_pcr_file_with_ct(ds_config$pcr_file, ds_name)
+      
+      # Continuous data - NO CT VALUES ANYMORE
+      continuous_list[[ds_name]] <- read_csv(ds_config$continuous_file, show_col_types = FALSE) %>%
+        select(sample_id, Pathogen, coverage_percentage, rpm, 
+               depth_of_coverage, viral_loads, Contam) %>%
+        mutate(across(c(coverage_percentage, rpm, depth_of_coverage, viral_loads), as.numeric),
+               Contam = ifelse(is.na(Contam), "NO", toupper(Contam))) %>%
+        mutate(original_dataset = ds_name)
+    }
+    
+    # Combine all PCR data
+    pcr_data <- bind_rows(pcr_list)
+    
+    # Combine all continuous data
+    continuous_data <- bind_rows(continuous_list)
+    
+  } else {
+    # Original loading for non-combined datasets
+    pcr_data <- process_pcr_file_with_ct(dataset_config$pcr_file, dataset_config$name)
+    
+    continuous_data <- read_csv(dataset_config$continuous_file, show_col_types = FALSE) %>%
+      select(sample_id, Pathogen, coverage_percentage, rpm, 
+             depth_of_coverage, viral_loads, Contam) %>%
+      mutate(across(c(coverage_percentage, rpm, depth_of_coverage, viral_loads), as.numeric),
+             Contam = ifelse(is.na(Contam), "NO", toupper(Contam)))
+  }
+  
+  # Get all unique samples and pathogens
+  all_samples <- unique(continuous_data$sample_id)
+  all_pathogens <- unique(continuous_data$Pathogen)
+  
+  # Create complete grid of all combinations
+  complete_df <- expand_grid(sample_id = all_samples, Pathogen = all_pathogens)
+  
+  # Join with original data and fill missing values
+  continuous_data_complete <- complete_df %>%
+    left_join(continuous_data, by = c("sample_id", "Pathogen")) %>%
+    mutate(
+      rpm = replace_na(rpm, 0),
+      coverage_percentage = replace_na(coverage_percentage, 0),
+      depth_of_coverage = replace_na(depth_of_coverage, 0),
+      viral_loads = replace_na(viral_loads, 0),
+      Contam = replace_na(Contam, "NO")
+    )
+  
+  # Add original_dataset column if it doesn't exist (for non-combined datasets)
+  if (!"original_dataset" %in% names(continuous_data_complete)) {
+    continuous_data_complete <- continuous_data_complete %>%
+      mutate(original_dataset = dataset_config$name)
+  }
+  
+  list(
+    name = dataset_config$name,
+    description = dataset_config$description,
+    pcr = pcr_data,
+    continuous = continuous_data_complete
+  )
+}
+
+datasets <- lapply(datasets, function(df) {
+  df$rpm <- as.numeric(df$rpm)
+  df
+})
+
+loaded_datasets <- map(datasets, prepare_dataset)
+names(loaded_datasets) <- map_chr(datasets, ~.x$name)
+```
+
+```{r, echo=FALSE}
+
+# Enhanced analysis functions with contamination adjustment
+analyze_thresholds <- function(dataset, metric_type, thresholds) {
+  if (!all(c("pcr", "continuous") %in% names(dataset))) {
+    return(list(results = NULL, results_contam = NULL, 
+                fn_samples = list(), fp_samples = list()))
+  }
+  
+  merged_data <- dataset$pcr %>%
+    left_join(dataset$continuous, by = c("sample_id","Pathogen"))
+  
+  results <- list()
+  results_contam <- list()  # For contamination-adjusted results
+  fn_samples <- list()
+  fp_samples <- list()
+  
+  for (threshold in thresholds) {
+    threshold_label <- paste0(metric_type, threshold)
+    
+    # Calculate SEQ_Result based on metric type
+    seq_data <- merged_data %>%
+      mutate(SEQ_Result = case_when(
+        metric_type == "cov" ~ ifelse(coverage_percentage >= threshold, 1, 0),
+        metric_type == "rpm" ~ ifelse(rpm >= threshold, 1, 0),
+        metric_type == "depth" ~ ifelse(depth_of_coverage >= threshold, 1, 0),
+        TRUE ~ 0
+      ))
+    
+    analysis_data <- seq_data %>% filter(!is.na(PCR_Result))
+    
+    # Original confusion matrix
+    TP <- sum(seq_data$PCR_Result == 1 & seq_data$SEQ_Result == 1, na.rm = TRUE)
+    TN <- sum(seq_data$PCR_Result == 0 & seq_data$SEQ_Result == 0, na.rm = TRUE)
+    FP <- sum(seq_data$PCR_Result == 0 & seq_data$SEQ_Result == 1, na.rm = TRUE)
+    FN <- sum(seq_data$PCR_Result == 1 & seq_data$SEQ_Result == 0, na.rm = TRUE)
+    
+    # Contamination-adjusted confusion matrix
+    TP_contam <- TP
+    TN_contam <- TN
+    FP_contam <- FP
+    FN_contam <- FN
+    
+    # Adjust for contamination: if Contam == "YES", change FP to TN and TP to FN
+    contamination_adjustments <- seq_data %>%
+      filter(!is.na(PCR_Result) & Contam == "YES") %>%
+      summarise(
+        FP_to_TN = sum(PCR_Result == 0 & SEQ_Result == 1, na.rm = TRUE),
+        TP_to_FN = sum(PCR_Result == 1 & SEQ_Result == 1, na.rm = TRUE)
+      )
+    
+    FP_contam <- FP - contamination_adjustments$FP_to_TN
+    TN_contam <- TN + contamination_adjustments$FP_to_TN
+    TP_contam <- TP - contamination_adjustments$TP_to_FN
+    FN_contam <- FN + contamination_adjustments$TP_to_FN
+    
+    # Calculate metrics
+    sensitivity <- ifelse((TP + FN) > 0, TP / (TP + FN), NA_real_)
+    specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), NA_real_)
+    
+    sensitivity_contam <- ifelse((TP_contam + FN_contam) > 0, 
+                                 TP_contam / (TP_contam + FN_contam), NA_real_)
+    specificity_contam <- ifelse((TN_contam + FP_contam) > 0, 
+                                 TN_contam / (TN_contam + FP_contam), NA_real_)
+    
+    results[[threshold_label]] <- tibble(
+      Threshold = threshold_label,
+      TP = TP, FN = FN, FP = FP, TN = TN,
+      Sensitivity = round(sensitivity, 3),
+      Specificity = round(specificity, 3),
+      PPV = ifelse((TP + FP) > 0, round(TP / (TP + FP), 3), NA_real_),
+      NPV = ifelse((TN + FN) > 0, round(TN / (TN + FN), 3), NA_real_),
+      Not_Tested = sum(is.na(seq_data$PCR_Result), na.rm = TRUE)
+    )
+    
+    results_contam[[threshold_label]] <- tibble(
+      Threshold = threshold_label,
+      TP = TP_contam, FN = FN_contam, FP = FP_contam, TN = TN_contam,
+      Sensitivity = round(sensitivity_contam, 3),
+      Specificity = round(specificity_contam, 3),
+      PPV = ifelse((TP_contam + FP_contam) > 0, 
+                   round(TP_contam / (TP_contam + FP_contam), 3), NA_real_),
+      NPV = ifelse((TN_contam + FN_contam) > 0, 
+                   round(TN_contam / (TN_contam + FN_contam), 3), NA_real_),
+      Not_Tested = sum(is.na(seq_data$PCR_Result), na.rm = TRUE)
+    )
+    
+    # Sample-level analysis
+    fn_samples[[threshold_label]] <- analysis_data %>%
+      filter(PCR_Result == 1 & SEQ_Result == 0) %>%
+      select(sample_id, Pathogen, PCR_Result, SEQ_Result, 
+             coverage_percentage, rpm, depth_of_coverage, ct_values, Contam)
+    
+    fp_samples[[threshold_label]] <- analysis_data %>%
+      filter(PCR_Result == 0 & SEQ_Result == 1) %>%
+      select(sample_id, Pathogen, PCR_Result, SEQ_Result, 
+             coverage_percentage, rpm, depth_of_coverage, ct_values, Contam)
+  }
+  
+  list(
+    results = bind_rows(results),
+    results_contam = bind_rows(results_contam),
+    fn_samples = fn_samples,
+    fp_samples = fp_samples
+  )
+}
+
+# Replace the display_contam_adjusted_confusion function with this improved version
+display_contam_adjusted_confusion <- function(dataset_name) {
+  ds <- loaded_datasets[[dataset_name]]
+  if (is.null(ds)) {
+    cat("Dataset not found\n")
+    return(NULL)
+  }
+  
+  # Get coverage results
+  cov_results <- all_results[[dataset_name]]$coverage
+  rpm_results <- all_results[[dataset_name]]$rpm
+  depth_results <- all_results[[dataset_name]]$depth
+  
+  # Create tables for each metric type
+  create_metric_table <- function(results, metric_name) {
+    if (is.null(results$results_contam) || nrow(results$results_contam) == 0) {
+      return(NULL)
+    }
+    
+    # Extract original and contam-adjusted results
+    orig <- results$results %>%
+      select(Threshold, TP, TN, FP, FN, Sensitivity, Specificity) %>%
+      mutate(Type = "Original")
+    
+    contam <- results$results_contam %>%
+      select(Threshold, TP, TN, FP, FN, Sensitivity, Specificity) %>%
+      mutate(Type = "Contam-Adjusted")
+    
+    # Combine and format
+    combined <- bind_rows(orig, contam) %>%
+      mutate(
+        TP = as.integer(TP),
+        TN = as.integer(TN),
+        FP = as.integer(FP),
+        FN = as.integer(FN),
+        Total = TP + TN + FP + FN,
+        Sensitivity = round(Sensitivity * 100, 1),
+        Specificity = round(Specificity * 100, 1)
+      ) %>%
+      select(Threshold, Type, TP, TN, FP, FN, Total, Sensitivity, Specificity)
+    
+    return(combined)
+  }
+  
+  # Create and display tables with improved headers
+  cat("\n#### Coverage Thresholds\n\n")
+  cat("*Confusion matrices showing Original vs Contamination-Adjusted results*\n\n")
+  cov_table <- create_metric_table(cov_results, "Coverage")
+  if (!is.null(cov_table)) {
+    print(kable(cov_table, 
+                caption = paste("Confusion Matrix -", dataset_name, "(Coverage Thresholds)"),
+                format = "html",
+                col.names = c("Threshold", "Type", "TP", "TN", "FP", "FN", "Total", "Sensitivity %", "Specificity %")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            row_spec(which(cov_table$Type == "Contam-Adjusted"), background = "#FFF3CD") %>%
+            add_header_above(c(" " = 2, "Confusion Matrix" = 4, " " = 1, "Performance Metrics" = 2)))
+  }
+  
+  cat("\n#### RPM Thresholds\n\n")
+  cat("*Confusion matrices showing Original vs Contamination-Adjusted results*\n\n")
+  rpm_table <- create_metric_table(rpm_results, "RPM")
+  if (!is.null(rpm_table)) {
+    print(kable(rpm_table,
+                caption = paste("Confusion Matrix -", dataset_name, "(RPM Thresholds)"),
+                format = "html",
+                col.names = c("Threshold", "Type", "TP", "TN", "FP", "FN", "Total", "Sensitivity %", "Specificity %")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            row_spec(which(rpm_table$Type == "Contam-Adjusted"), background = "#FFF3CD") %>%
+            add_header_above(c(" " = 2, "Confusion Matrix" = 4, " " = 1, "Performance Metrics" = 2)))
+  }
+  
+  cat("\n#### Depth Thresholds\n\n")
+  cat("*Confusion matrices showing Original vs Contamination-Adjusted results*\n\n")
+  depth_table <- create_metric_table(depth_results, "Depth")
+  if (!is.null(depth_table)) {
+    print(kable(depth_table,
+                caption = paste("Confusion Matrix -", dataset_name, "(Depth Thresholds)"),
+                format = "html",
+                col.names = c("Threshold", "Type", "TP", "TN", "FP", "FN", "Total", "Sensitivity %", "Specificity %")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            row_spec(which(depth_table$Type == "Contam-Adjusted"), background = "#FFF3CD") %>%
+            add_header_above(c(" " = 2, "Confusion Matrix" = 4, " " = 1, "Performance Metrics" = 2)))
+  }
+}
+
+# Function to calculate 95% CI for sensitivity and specificity
+calculate_ci_contam <- function(dataset_name, metric_type = "coverage") {
+  ds <- loaded_datasets[[dataset_name]]
+  if (is.null(ds)) {
+    cat("Dataset not found\n")
+    return(NULL)
+  }
+  
+  # Get results based on metric type
+  if (metric_type == "coverage") {
+    results <- all_results[[dataset_name]]$coverage$results_contam
+  } else if (metric_type == "rpm") {
+    results <- all_results[[dataset_name]]$rpm$results_contam
+  } else if (metric_type == "depth") {
+    results <- all_results[[dataset_name]]$depth$results_contam
+  } else {
+    cat("Invalid metric_type. Use 'coverage', 'rpm', or 'depth'\n")
+    return(NULL)
+  }
+  
+  if (is.null(results) || nrow(results) == 0) {
+    cat("No results found\n")
+    return(NULL)
+  }
+  
+  # Calculate 95% CI using Wilson score interval
+  calc_wilson_ci <- function(x, n, conf_level = 0.95) {
+    if (n == 0) return(c(NA, NA))
+    z <- qnorm(1 - (1 - conf_level)/2)
+    p <- x/n
+    # Wilson score interval
+    denominator <- 1 + z^2/n
+    centre <- (p + z^2/(2*n)) / denominator
+    spread <- z * sqrt((p*(1-p)/n) + z^2/(4*n^2)) / denominator
+    return(c(max(0, centre - spread), min(1, centre + spread)))
+  }
+  
+  # Add CI columns
+  results_with_ci <- results %>%
+    mutate(
+      Total = TP + TN + FP + FN,
+      # Sensitivity CI
+      Sens_CI_Lower = map2_dbl(TP, TP + FN, ~calc_wilson_ci(.x, .y)[1]),
+      Sens_CI_Upper = map2_dbl(TP, TP + FN, ~calc_wilson_ci(.x, .y)[2]),
+      # Specificity CI
+      Spec_CI_Lower = map2_dbl(TN, TN + FP, ~calc_wilson_ci(.x, .y)[1]),
+      Spec_CI_Upper = map2_dbl(TN, TN + FP, ~calc_wilson_ci(.x, .y)[2]),
+      # Format for display
+      Sensitivity_CI = sprintf("%.1f%% (%.1f%%-%.1f%%)", 
+                               Sensitivity * 100,
+                               Sens_CI_Lower * 100,
+                               Sens_CI_Upper * 100),
+      Specificity_CI = sprintf("%.1f%% (%.1f%%-%.1f%%)", 
+                               Specificity * 100,
+                               Spec_CI_Lower * 100,
+                               Spec_CI_Upper * 100)
+    ) %>%
+    select(Threshold, TP, FN, FP, TN, Total, 
+           Sensitivity_CI, Specificity_CI)
+  
+  return(results_with_ci)
+}
+
+# Function to get contamination-adjusted FP and FN samples
+get_contamination_adjusted_fp_fn <- function(dataset, metric_type = "cov", threshold = 10) {
+  if (!all(c("pcr", "continuous") %in% names(dataset))) {
+    return(list(fp_samples = NULL, fn_samples = NULL))
+  }
+  
+  merged_data <- inner_join(dataset$pcr, dataset$continuous, 
+                          by = c("sample_id", "Pathogen")) %>%
+    filter(!is.na(PCR_Result))  # Remove "Not tested"
+  
+  # Calculate SEQ_Result based on metric type
+  seq_data <- merged_data %>%
+    mutate(SEQ_Result = case_when(
+      metric_type == "cov" ~ ifelse(coverage_percentage >= threshold, 1, 0),
+      metric_type == "rpm" ~ ifelse(rpm >= threshold, 1, 0),
+      metric_type == "depth" ~ ifelse(depth_of_coverage >= threshold, 1, 0),
+      TRUE ~ 0
+    ))
+  
+  # Calculate contamination-adjusted results
+  # For contamination samples: SEQ_Result becomes 0 regardless of threshold
+  seq_data_contam <- seq_data %>%
+    mutate(
+      SEQ_Result_Adjusted = case_when(
+        Contam == "YES" ~ 0,
+        TRUE ~ SEQ_Result
+      )
+    )
+  
+  # Get contamination-adjusted FP (PCR=0, SEQ_Adjusted=1)
+  fp_contam <- seq_data_contam %>%
+    filter(PCR_Result == 0 & SEQ_Result_Adjusted == 1) %>%
+    select(sample_id, Pathogen, PCR_Result, SEQ_Result, SEQ_Result_Adjusted,
+           coverage_percentage, rpm, depth_of_coverage, ct_values, Contam) %>%
+    mutate(
+      Error_Type = "False Positive",
+      Adjustment = as.character(ifelse(SEQ_Result == 1 & SEQ_Result_Adjusted == 0, 
+                              "Corrected (Contamination)", "Unchanged"))
+    )
+  
+  # Get contamination-adjusted FN (PCR=1, SEQ_Adjusted=0)
+  fn_contam <- seq_data_contam %>%
+    filter(PCR_Result == 1 & SEQ_Result_Adjusted == 0) %>%
+    select(sample_id, Pathogen, PCR_Result, SEQ_Result, SEQ_Result_Adjusted,
+           coverage_percentage, rpm, depth_of_coverage, ct_values, Contam) %>%
+    mutate(
+      Error_Type = "False Negative",
+      Adjustment = as.character(ifelse(SEQ_Result == 1 & SEQ_Result_Adjusted == 0, 
+                              "Corrected (Contamination)", "Unchanged"))
+    )
+  
+  # Combine and add metadata
+  all_errors <- bind_rows(fp_contam, fn_contam) %>%
+    mutate(
+      Metric = paste0(metric_type, "=", threshold),
+      Dataset = dataset$name,
+      .before = 1
+    ) %>%
+    arrange(Error_Type, sample_id)
+  
+  # Create summary statistics
+  summary_stats <- all_errors %>%
+    group_by(Error_Type, Adjustment) %>%
+    summarise(
+      Count = n(),
+      .groups = "drop"
+    )
+  
+  list(
+    all_errors = all_errors,
+    fp_samples = fp_contam,
+    fn_samples = fn_contam,
+    summary = summary_stats
+  )
+}
+
+# Wrapper functions for specific metric types
+analyze_coverage <- function(dataset) {
+  analyze_thresholds(dataset, "cov", c(10, 20, 50, 80, 90))
+}
+
+analyze_rpm <- function(dataset) {
+  analyze_thresholds(dataset, "rpm", c(1, 10, 100, 1000))
+}
+
+analyze_depth <- function(dataset) {
+  analyze_thresholds(dataset, "depth", c(10, 30))
+}
+
+generate_roc <- function(dataset) {
+  if (!all(c("pcr", "continuous") %in% names(dataset))) {
+    return(list(performance = tibble(Metric = character(), AUC = numeric())))
+  }
+  
+  roc_data <- inner_join(dataset$pcr, dataset$continuous, 
+                        by = c("sample_id", "Pathogen")) %>%
+    filter(!is.na(PCR_Result)) %>%  # Exclude "Not tested"
+    drop_na()
+  
+  if (nrow(roc_data) == 0 || length(unique(roc_data$PCR_Result)) != 2) {
+    return(list(performance = tibble(Metric = character(), AUC = numeric())))
+  }
+  
+  roc_coverage <- try(roc(PCR_Result ~ coverage_percentage, data = roc_data), silent = TRUE)
+  roc_rpm <- try(roc(PCR_Result ~ rpm, data = roc_data), silent = TRUE)
+  roc_depth <- try(roc(PCR_Result ~ depth_of_coverage, data = roc_data), silent = TRUE)
+  
+  performance <- tibble(
+    Metric = c("Coverage", "RPM", "Depth"),
+    AUC = c(
+      if (!inherits(roc_coverage, "try-error")) auc(roc_coverage) else NA_real_,
+      if (!inherits(roc_rpm, "try-error")) auc(roc_rpm) else NA_real_,
+      if (!inherits(roc_depth, "try-error")) auc(roc_depth) else NA_real_
+    )
+  )
+  
+  list(
+    roc_data = roc_data,
+    roc_objects = list(coverage = roc_coverage, rpm = roc_rpm, depth = roc_depth),
+    performance = performance
+  )
+}
+
+
+# Function to create contamination-adjusted performance plots
+create_contamination_plots <- function(dataset_name, metric_type = "coverage") {
+  ds_results <- all_results[[dataset_name]]
+  
+  if (is.null(ds_results)) return(NULL)
+  
+  # Get the appropriate results based on metric type
+  if (metric_type == "coverage") {
+    orig_results <- ds_results$coverage$results
+    contam_results <- ds_results$coverage$results_contam
+    thresholds <- orig_results$Threshold
+  } else if (metric_type == "rpm") {
+    orig_results <- ds_results$rpm$results
+    contam_results <- ds_results$rpm$results_contam
+    thresholds <- orig_results$Threshold
+  } else if (metric_type == "depth") {
+    orig_results <- ds_results$depth$results
+    contam_results <- ds_results$depth$results_contam
+    thresholds <- orig_results$Threshold
+  } else {
+    return(NULL)
+  }
+  
+  if (is.null(orig_results) || is.null(contam_results)) return(NULL)
+  
+  # Combine original and contamination-adjusted results
+  combined_data <- bind_rows(
+    orig_results %>% mutate(Group = "Original"),
+    contam_results %>% mutate(Group = "Contamination-Adjusted")
+  ) %>%
+    mutate(Threshold_Value = as.numeric(gsub("[^0-9]", "", Threshold)))
+  
+  # Create plots for each metric
+  metrics <- c("Sensitivity", "Specificity", "TP", "FN", "FP", "TN")
+  
+  plots <- list()
+  
+  for (metric in metrics) {
+    p <- ggplot(combined_data, aes(x = Threshold_Value, y = .data[[metric]], 
+                                    color = Group, group = Group)) +
+      geom_line(size = 1.5) +
+      geom_point(size = 3) +
+      labs(title = paste(metric, "vs", metric_type, "Threshold"),
+           x = paste(metric_type, "Threshold"),
+           y = metric,
+           color = "Group") +
+      custom_theme() +
+      scale_color_manual(values = c("Original" = "#1F77B4", 
+                                    "Contamination-Adjusted" = "red")) +
+      theme(legend.position = "bottom")
+    
+    plots[[metric]] <- p
+  }
+  
+  # Arrange plots
+  combined_plot <- (plots[["Sensitivity"]] + plots[["Specificity"]]) / 
+                   (plots[["TP"]] + plots[["FN"]]) /
+                   (plots[["FP"]] + plots[["TN"]]) +
+    plot_layout(guides = "collect") &
+    theme(legend.position = "bottom")
+  
+  return(combined_plot)
+}
+
+# Function to create combined plot with A, B, C labels (vertical arrangement)
+create_combined_faceted_plot <- function() {
+  library(patchwork)
+  
+  plots <- list()
+  labels <- c("A.", "B.", "C.")
+  dataset_names <- c("PathCare", "NHLS_GS", "NHLS_TY", "Mucokids", "SUDI" )
+  
+  # Create individual plots WITHOUT legends
+  for (i in seq_along(dataset_names)) {
+    ds_name <- dataset_names[i]
+    if (ds_name %in% names(loaded_datasets)) {
+      p <- create_faceted_ct_plot(ds_name)
+      if (!is.null(p)) {
+        # Extract plot data to get all pathogens
+        plot_data <- p$data
+        
+        # Remove legend from individual plots
+        plots[[i]] <- p + 
+          labs(subtitle = paste0(labels[i]),
+               x = "Depth of coverage",
+               y = "Genome coverage (%)") +
+          theme(
+            plot.subtitle = element_text(size = 16, hjust = 0, 
+                                        margin = margin(b = 5, t = 5)),
+            legend.position = "none",  # Remove individual legends
+            axis.title = element_text(size = 16),
+            axis.text = element_text(size = 14),
+            strip.text = element_text(size = 14, face = "bold")
+          )
+      }
+    }
+  }
+  
+  # Remove NULL plots
+  plots <- plots[!sapply(plots, is.null)]
+  
+  if (length(plots) == 0) return(NULL)
+  
+  # Create a common legend
+  # Get data from first plot to extract pathogens
+  first_plot_data <- plots[[1]]$data
+  all_pathogens <- unique(first_plot_data$Pathogen)
+  
+  # Create a dummy plot just for the legend using Dark2 palette
+  dummy_plot <- ggplot(first_plot_data, aes(x = depth_of_coverage, y = coverage_percentage, 
+                                          color = Pathogen)) +
+  geom_point() +
+  scale_color_brewer(
+    palette = "Dark2",
+    name = "Pathogen",
+    guide = guide_legend(
+      ncol = 2,        # 2 columns
+      byrow = TRUE,    # fill by row
+      override.aes = list(size = 5), # point size in legend
+      keywidth = 1,    # remove extra space
+      keyheight = 1
+    )
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16),
+    legend.key = element_blank(),  # remove box around colors
+    legend.spacing.x = unit(0.3, "cm")
+  )
+  
+  # Extract legend
+  common_legend <- cowplot::get_legend(dummy_plot)
+  
+  # Combine plots vertically
+  combined_plot <- wrap_plots(plots, ncol = 1, heights = rep(1, length(plots))) &
+    theme(
+      plot.margin = margin(10, 10, 10, 10)
+    )
+  
+  # Add common legend at the bottom
+  final_plot <- combined_plot / 
+    plot_spacer() /  # Small spacer
+    common_legend +
+    plot_layout(
+      ncol = 1,
+      heights = c(rep(1, length(plots)), 0.1, 0.2)  # Adjust heights for plots, spacer, legend
+    )
+  
+  return(final_plot)
+}
+
+# Also update the create_faceted_ct_plot function to use Dark2 palette
+create_faceted_ct_plot <- function(dataset_name) {
+  ds <- loaded_datasets[[dataset_name]]
+  
+  if (is.null(ds)) return(NULL)
+  
+  PathCare_data <- inner_join(ds$pcr, ds$continuous,
+                          by = c("sample_id", "Pathogen")) %>%
+    filter(!is.na(ct_values) & ct_values > 0) %>%
+    mutate(Ct_bin = cut(ct_values, breaks = c(-Inf, 20, 30, Inf),
+                        labels = c("Ct <20", "Ct 20–30", "Ct >30")))
+  
+  library(scales)
+  
+  # Get unique pathogens in this dataset
+  dataset_pathogens <- unique(PathCare_data$Pathogen)
+  
+  facet_ct <- ggplot(PathCare_data, aes(x = depth_of_coverage, y = coverage_percentage,
+                                     color = Pathogen)) +
+    geom_point(alpha = 0.7, size = 3) +
+    facet_wrap(~Ct_bin) +
+    labs(title = NULL,
+         x = "Depth of coverage",
+         y = "Genome coverage (%)") +
+    custom_theme(base_size = 14) +  # Increased base size
+    scale_color_brewer(palette = "Dark2") +  # Use Dark2 palette
+    scale_y_continuous(labels = percent_format(scale = 1)) +
+    scale_x_log10(labels = label_number(accuracy = 1)) +
+    theme(
+      legend.position = "right",
+      strip.text = element_text(size = 12, face = "bold"),
+      panel.spacing = unit(1.5, "lines"),
+      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+      strip.background = element_rect(color = "black", linewidth = 0.8),
+      axis.title = element_text(size = 16, ),
+      axis.text = element_text(size = 14),
+      legend.text = element_text(size = 12),
+      legend.title = element_text(size = 11, face = "bold")
+    )
+  
+  return(facet_ct)
+}
+
+create_contamination_performance_heatmap <- function(dataset_name, save_plot = TRUE) {
+  ds <- loaded_datasets[[dataset_name]]
+  if (is.null(ds)) {
+    return(ggplot() + labs(title = paste("No dataset:", dataset_name)))
+  }
+  
+  # Prepare data - ALL samples
+  merged_data <- inner_join(ds$pcr, ds$continuous, 
+                          by = c("sample_id", "Pathogen")) %>%
+    filter(!is.na(PCR_Result))  # Remove "Not tested"
+  
+  # Define thresholds
+  coverage_thresholds <- c(0, 1, 10, 20, 50, 80, 90)
+  
+  # Calculate performance for each combination
+  results <- tibble()
+  
+  for (cov_thresh in coverage_thresholds) {
+    # LAYER 1: What if we IGNORE the Contam column (no contamination filtering)
+    data_layer1 <- merged_data %>%
+      mutate(
+        SEQ_Result = ifelse(coverage_percentage >= cov_thresh, 1, 0)
+      )
+    
+    # Confusion matrix for layer 1
+    TP1 <- sum(data_layer1$PCR_Result == 1 & data_layer1$SEQ_Result == 1, na.rm = TRUE)
+    TN1 <- sum(data_layer1$PCR_Result == 0 & data_layer1$SEQ_Result == 0, na.rm = TRUE)
+    FP1 <- sum(data_layer1$PCR_Result == 0 & data_layer1$SEQ_Result == 1, na.rm = TRUE)
+    FN1 <- sum(data_layer1$PCR_Result == 1 & data_layer1$SEQ_Result == 0, na.rm = TRUE)
+    
+    # Calculate metrics for layer 1
+    sensitivity1 <- ifelse((TP1 + FN1) > 0, TP1 / (TP1 + FN1), NA)
+    specificity1 <- ifelse((TN1 + FP1) > 0, TN1 / (TN1 + FP1), NA)
+    accuracy1 <- ifelse((TP1 + TN1 + FP1 + FN1) > 0, 
+                       (TP1 + TN1) / (TP1 + TN1 + FP1 + FN1), NA)
+    precision1 <- ifelse((TP1 + FP1) > 0, TP1 / (TP1 + FP1), NA)
+    f1_score1 <- ifelse((precision1 + sensitivity1) > 0, 
+                        2 * (precision1 * sensitivity1) / (precision1 + sensitivity1), NA)
+    
+    # LAYER 2: Current reality - Contam column ALREADY reflects contamination filtering
+    data_layer2 <- merged_data %>%
+      mutate(
+        SEQ_Result = case_when(
+          Contam == "YES" ~ 0,
+          coverage_percentage >= cov_thresh ~ 1,
+          TRUE ~ 0
+        )
+      )
+    
+    # Confusion matrix for layer 2
+    TP2 <- sum(data_layer2$PCR_Result == 1 & data_layer2$SEQ_Result == 1, na.rm = TRUE)
+    TN2 <- sum(data_layer2$PCR_Result == 0 & data_layer2$SEQ_Result == 0, na.rm = TRUE)
+    FP2 <- sum(data_layer2$PCR_Result == 0 & data_layer2$SEQ_Result == 1, na.rm = TRUE)
+    FN2 <- sum(data_layer2$PCR_Result == 1 & data_layer2$SEQ_Result == 0, na.rm = TRUE)
+    
+    # Calculate metrics for layer 2
+    sensitivity2 <- ifelse((TP2 + FN2) > 0, TP2 / (TP2 + FN2), NA)
+    specificity2 <- ifelse((TN2 + FP2) > 0, TN2 / (TN2 + FP2), NA)
+    accuracy2 <- ifelse((TP2 + TN2 + FP2 + FN2) > 0, 
+                       (TP2 + TN2) / (TP2 + TN2 + FP2 + FN2), NA)
+    precision2 <- ifelse((TP2 + FP2) > 0, TP2 / (TP2 + FP2), NA)
+    f1_score2 <- ifelse((precision2 + sensitivity2) > 0, 
+                        2 * (precision2 * sensitivity2) / (precision2 + sensitivity2), NA)
+    
+    # Count how many samples are contaminated
+    contaminated_samples <- sum(merged_data$Contam == "YES", na.rm = TRUE)
+    
+    # Count how many would change if we ignored contamination
+    would_change <- merged_data %>%
+      mutate(
+        without_contam = ifelse(coverage_percentage >= cov_thresh, 1, 0),
+        with_contam = case_when(
+          Contam == "YES" ~ 0,
+          coverage_percentage >= cov_thresh ~ 1,
+          TRUE ~ 0
+        )
+      ) %>%
+      filter(without_contam != with_contam) %>%
+      nrow()
+    
+    # Add both layers to results
+    results <- bind_rows(results,
+      # Layer 1: Ignore contamination (hypothetical)
+      tibble(
+        Coverage_Threshold = cov_thresh,
+        Layer = "No",
+        Sensitivity = sensitivity1,
+        Specificity = specificity1,
+        F1_Score = f1_score1,
+        Accuracy = accuracy1,
+        TP = TP1, FN = FN1, FP = FP1, TN = TN1,
+        Sample_Count = nrow(data_layer1),
+        Positive_Count = sum(data_layer1$PCR_Result == 1),
+        Contaminated_Samples = contaminated_samples,
+        Samples_Affected = would_change
+      ),
+      # Layer 2: With contamination filtering (current approach)
+      tibble(
+        Coverage_Threshold = cov_thresh,
+        Layer = "Yes",
+        Sensitivity = sensitivity2,
+        Specificity = specificity2,
+        F1_Score = f1_score2,
+        Accuracy = accuracy2,
+        TP = TP2, FN = FN2, FP = FP2, TN = TN2,
+        Sample_Count = nrow(data_layer2),
+        Positive_Count = sum(data_layer2$PCR_Result == 1),
+        Contaminated_Samples = contaminated_samples,
+        Samples_Affected = would_change
+      )
+    )
+  }
+  
+  # Round values
+  results <- results %>%
+    mutate(across(c(Sensitivity, Specificity, F1_Score, Accuracy), ~round(., 3)))
+  
+  # Create heatmaps for sensitivity, specificity, and accuracy only
+  metrics_to_plot <- c("Sensitivity", "Specificity", "Accuracy")
+  plots <- list()
+  
+  for (metric in metrics_to_plot) {
+    if (!metric %in% names(results)) {
+      message("Warning: ", metric, " column not found in results")
+      plots[[metric]] <- ggplot() + 
+        labs(title = paste(metric, "-", dataset_name),
+             subtitle = "Metric not available")
+      next
+    }
+    
+    # Filter out NA values for this metric
+    plot_data <- results %>%
+      filter(!is.na(.data[[metric]]))
+    
+    if (nrow(plot_data) == 0) {
+      message("No valid data for metric: ", metric)
+      plots[[metric]] <- ggplot() + 
+        labs(title = paste(metric),
+             subtitle = "No valid data")
+      next
+    }
+    
+    # Create the plot
+    p <- ggplot(plot_data, aes(x = factor(Coverage_Threshold), 
+                               y = Layer)) +
+      geom_tile(aes(fill = .data[[metric]]), color = "white", size = 0.5) +
+      geom_text(aes(label = round(.data[[metric]], 3)), 
+                color = "black", size = 4, fontface = "bold") +
+      scale_fill_gradient2(
+        low = "#626DD0",
+        mid = "lightblue",
+        high = "red",
+        midpoint = 0.8,
+        limits = c(0.6, 1.0),
+        oob = scales::squish,
+        name = metric,
+        na.value = "grey90"
+      ) +
+      labs(
+        x = "Coverage Threshold (%)",   # x-axis label
+        y = "Contamination"                 # y-axis label
+      ) +
+      theme_minimal() +
+      theme(
+        axis.title = element_text(size = 15),
+        axis.text.y = element_text(face = "bold", size = 13),
+        axis.text.x = element_text(size = 13),
+        legend.position = "right",
+        legend.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 10),
+        #panel.grid = element_blank(),
+        #plot.margin = margin(5, 5, 5, 5)
+      )
+    
+    plots[[metric]] <- p
+  }
+  
+  # Check if we have valid plots
+  valid_plots <- plots[sapply(plots, function(p) inherits(p, "ggplot"))]
+  
+  if (length(valid_plots) == 3) {
+    # Combine the 3 plots horizontally
+    combined_plot <- valid_plots[["Sensitivity"]] + valid_plots[["Specificity"]] + valid_plots[["Accuracy"]] +
+      plot_layout(nrow = 1, widths = c(1, 1, 1))
+    
+    # Save the plot if requested
+    if (save_plot) {
+      output_dir <- "contamination_heatmaps"
+      if (!dir.exists(output_dir)) {
+        dir.create(output_dir)
+      }
+      
+      filename <- file.path(output_dir, paste0("contamination_performance_1", dataset_name, ".png"))
+      ggsave(filename, plot = combined_plot, width = 15, height = 2.5, dpi = 300, bg = "white")
+      
+      cat("Plot saved as:", filename, "\n")
+    }
+    
+    return(combined_plot)
+    
+  } else if (length(valid_plots) > 0) {
+    # Create and save what we have
+    message("Only ", length(valid_plots), " valid plots created for ", dataset_name)
+    
+    combined_plot <- wrap_plots(valid_plots, nrow = 1, guides = "collect")
+    
+    # Save the plot if requested
+    if (save_plot) {
+      output_dir <- "contamination_heatmaps"
+      if (!dir.exists(output_dir)) {
+        dir.create(output_dir)
+      }
+      
+      filename <- file.path(output_dir, paste0("contamination_performance_", dataset_name, "_partial1.png"))
+      ggsave(filename, plot = combined_plot, width = 20, height = 2.5, dpi = 300, bg = "white")
+      
+      cat("Partial plot saved as:", filename, "\n")
+    }
+    
+    return(combined_plot)
+    
+  } else {
+    message("No valid plots created for ", dataset_name)
+    return(ggplot() + 
+             labs(title = paste("No valid heatmaps for", dataset_name),
+                  subtitle = "Check data structure and contamination column"))
+  }
+}
+
+reads_file <- "./VCS_Meta_updated.csv"
+
+create_summary_table <- function() {
+  summary_list <- list()
+  
+  # Load the reads data file
+  if (file.exists(reads_file)) {
+    reads_data <- read_csv(reads_file, show_col_types = FALSE)
+    
+    if ("fileName" %in% colnames(reads_data)) {
+      reads_data <- reads_data %>% rename(sample_id = fileName)
+    }
+    if ("totalReads" %in% colnames(reads_data)) {
+      reads_data <- reads_data %>% rename(total_reads = totalReads)
+    }
+    
+    if (!"sample_id" %in% colnames(reads_data)) {
+      possible_id_cols <- c("sample", "Sample", "SampleID", "sampleID", "id", "ID")
+      for (col in possible_id_cols) {
+        if (col %in% colnames(reads_data)) {
+          reads_data <- reads_data %>% rename(sample_id = all_of(col))
+          break
+        }
+      }
+    }
+  } else {
+    warning("Reads file not found at: ", reads_file)
+    reads_data <- NULL
+  }
+  
+  all_dataset_names <- c("PathCare", "NHLS_GS", "NHLS_TY", "Mucokids", "SUDI", "ALL_COMBINED")
+  
+  for (ds_name in all_dataset_names) {
+    if (!ds_name %in% names(loaded_datasets)) next
+    
+    ds <- loaded_datasets[[ds_name]]
+    
+    # 1. Number of samples in sampleset
+    num_samples <- length(unique(ds$continuous$sample_id))
+    
+    # 2. Number of positive PCR detections
+    pcr_detections <- ds$pcr %>%
+      filter(PCR_Result == 1) %>%
+      nrow()
+    
+    # 3. Reads per sample, median (IQR) - from reads file
+    read_stats <- "N/A"
+    if (!is.null(reads_data) && "sample_id" %in% colnames(reads_data) && 
+        "total_reads" %in% colnames(reads_data)) {
+      
+      ds_samples <- unique(ds$continuous$sample_id)
+      dataset_reads <- reads_data %>%
+        filter(sample_id %in% ds_samples) %>%
+        pull(total_reads)
+      
+      if (length(dataset_reads) > 0 && !all(is.na(dataset_reads))) {
+        median_reads <- median(dataset_reads, na.rm = TRUE)
+        q1_reads <- quantile(dataset_reads, 0.25, na.rm = TRUE)
+        q3_reads <- quantile(dataset_reads, 0.75, na.rm = TRUE)
+        read_stats <- sprintf("%.0f (%.0f-%.0f)", 
+                             median_reads, q1_reads, q3_reads)
+      }
+    }
+    
+    # 4. Sensitivity at 10% genome coverage (Original)
+    sensitivity_10 <- NA
+    specificity_10 <- NA
+    
+    if (!is.null(all_results[[ds_name]]$coverage$results)) {
+      cov10_results <- all_results[[ds_name]]$coverage$results %>%
+        filter(Threshold == "cov10")
+      
+      if (nrow(cov10_results) > 0) {
+        sensitivity_10 <- cov10_results$Sensitivity[1]
+        specificity_10 <- cov10_results$Specificity[1]
+      }
+    }
+    
+    # 5. Ct < 30 sensitivity (Original) - FOR ALL DATASETS
+ct30_sensitivity_original <- NA
+ct30_merged <- inner_join(ds$pcr, ds$continuous, by = c("sample_id", "Pathogen")) %>%
+  filter(!is.na(PCR_Result), !is.na(ct_values), ct_values < 30, ct_values > 0) %>%
+  mutate(SEQ_Result = ifelse(coverage_percentage >= 10, 1, 0))
+
+TP_ct30 <- sum(ct30_merged$PCR_Result == 1 & ct30_merged$SEQ_Result == 1, na.rm = TRUE)
+FN_ct30 <- sum(ct30_merged$PCR_Result == 1 & ct30_merged$SEQ_Result == 0, na.rm = TRUE)
+ct30_sensitivity_original <- ifelse((TP_ct30 + FN_ct30) > 0, TP_ct30 / (TP_ct30 + FN_ct30), NA_real_)
+
+# 6. Ct < 30 sensitivity (Contamination-Adjusted) - FOR ALL DATASETS
+ct30_sensitivity_contam <- NA
+ct30_merged_contam <- inner_join(ds$pcr, ds$continuous, by = c("sample_id", "Pathogen")) %>%
+  filter(!is.na(PCR_Result), !is.na(ct_values), ct_values < 30, ct_values > 0) %>%
+  mutate(SEQ_Result = case_when(
+    Contam == "YES" ~ 0,
+    coverage_percentage >= 10 ~ 1,
+    TRUE ~ 0
+  ))
+
+TP_ct30_contam <- sum(ct30_merged_contam$PCR_Result == 1 & ct30_merged_contam$SEQ_Result == 1, na.rm = TRUE)
+FN_ct30_contam <- sum(ct30_merged_contam$PCR_Result == 1 & ct30_merged_contam$SEQ_Result == 0, na.rm = TRUE)
+ct30_sensitivity_contam <- ifelse((TP_ct30_contam + FN_ct30_contam) > 0, 
+                                  TP_ct30_contam / (TP_ct30_contam + FN_ct30_contam), NA_real_)
+    
+    # 7. Sequencing success (genome coverage >80%, depth >10)
+    sequencing_success <- inner_join(ds$pcr, ds$continuous,
+                                    by = c("sample_id", "Pathogen")) %>%
+      filter(PCR_Result == 1) %>%
+      summarise(
+        success = sum(coverage_percentage >= 80 & depth_of_coverage >= 10, na.rm = TRUE),
+        total = n(),
+        percent = ifelse(total > 0, round(success / total * 100, 1), 0)
+      )
+    
+    sequencing_success_str <- if (sequencing_success$total > 0) {
+      sprintf("%d/%d (%.1f%%)", 
+              sequencing_success$success, 
+              sequencing_success$total, 
+              sequencing_success$percent)
+    } else {
+      "N/A"
+    }
+    
+    # 8. Sequencing success for pathogens at Ct values <30
+    ct_success <- inner_join(ds$pcr, ds$continuous,
+                            by = c("sample_id", "Pathogen")) %>%
+      filter(PCR_Result == 1 & !is.na(ct_values) & ct_values < 30 & ct_values > 0) %>%
+      summarise(
+        success = sum(coverage_percentage >= 0.1, na.rm = TRUE),
+        total = n(),
+        percent = ifelse(total > 0, round(success / total * 100, 1), 0)
+      )
+    
+    ct_success_str <- if (ct_success$total > 0) {
+      sprintf("%d/%d (%.1f%%)", 
+              ct_success$success, 
+              ct_success$total, 
+              ct_success$percent)
+    } else {
+      "N/A"
+    }
+    
+    # Store summary - base metrics for all datasets
+    summary_metrics <- c(
+      "Number of samples" = as.character(num_samples),
+      "Positive PCR detections" = as.character(pcr_detections),
+      "Reads per sample, median (IQR)" = read_stats,
+      "Sensitivity at 10% genome coverage" = ifelse(!is.na(sensitivity_10), 
+                                                    paste0(round(sensitivity_10 * 100, 1), "%"), 
+                                                    "N/A"),
+      "Specificity at 10% genome coverage" = ifelse(!is.na(specificity_10), 
+                                                    paste0(round(specificity_10 * 100, 1), "%"), 
+                                                    "N/A"),
+      "Sequencing success (coverage >80%, depth >10)" = sequencing_success_str,
+      "Sequencing success (Ct <30, coverage >10%)" = ct_success_str,
+  # Add Ct < 30 sensitivity metrics for ALL datasets
+  "Sensitivity Ct<30 (Original)" = ifelse(!is.na(ct30_sensitivity_original), 
+                                          paste0(round(ct30_sensitivity_original * 100, 1), "%"), 
+                                          "N/A"),
+  "Sensitivity Ct<30 (Contam Adj)" = ifelse(!is.na(ct30_sensitivity_contam), 
+                                            paste0(round(ct30_sensitivity_contam * 100, 1), "%"), 
+                                            "N/A")
+)
+    
+    summary_list[[ds_name]] <- summary_metrics
+  }
+  
+  # Create summary table
+  summary_df <- as.data.frame(do.call(cbind, summary_list))
+  
+  # Add row names as first column
+  summary_df <- cbind(
+    data.frame(Metric = rownames(summary_df)),
+    summary_df
+  )
+  rownames(summary_df) <- NULL
+  
+  return(summary_df)
+}
+
+# Enhanced function to create Ct < 30 coverage threshold tables with sample-level details
+create_ct30_coverage_table <- function(dataset_name) {
+  ds <- loaded_datasets[[dataset_name]]
+  if (is.null(ds)) {
+    cat("Dataset not found\n")
+    return(NULL)
+  }
+  
+  # Get Ct < 30 filtered data
+  merged_data <- inner_join(ds$pcr, ds$continuous, by = c("sample_id", "Pathogen")) %>%
+    filter(!is.na(PCR_Result), !is.na(ct_values), ct_values < 30, ct_values > 0)
+  
+  # Define coverage thresholds
+  coverage_thresholds <- c(10, 20, 50, 80, 90)
+  
+  # Initialize results
+  results_list <- list()
+  fp_samples_list <- list()
+  fn_samples_list <- list()
+  
+  for (threshold in coverage_thresholds) {
+    # ORIGINAL (no contamination adjustment)
+    seq_orig <- merged_data %>%
+      mutate(SEQ_Result = ifelse(coverage_percentage >= threshold, 1, 0))
+    
+    TP_orig <- sum(seq_orig$PCR_Result == 1 & seq_orig$SEQ_Result == 1, na.rm = TRUE)
+    FN_orig <- sum(seq_orig$PCR_Result == 1 & seq_orig$SEQ_Result == 0, na.rm = TRUE)
+    FP_orig <- sum(seq_orig$PCR_Result == 0 & seq_orig$SEQ_Result == 1, na.rm = TRUE)
+    TN_orig <- sum(seq_orig$PCR_Result == 0 & seq_orig$SEQ_Result == 0, na.rm = TRUE)
+    
+    sens_orig <- ifelse((TP_orig + FN_orig) > 0, TP_orig / (TP_orig + FN_orig), NA_real_)
+    spec_orig <- ifelse((TN_orig + FP_orig) > 0, TN_orig / (TN_orig + FP_orig), NA_real_)
+    
+    # CONTAMINATION-ADJUSTED
+    seq_contam <- merged_data %>%
+      mutate(SEQ_Result = case_when(
+        Contam == "YES" ~ 0,
+        coverage_percentage >= threshold ~ 1,
+        TRUE ~ 0
+      ))
+    
+    TP_contam <- sum(seq_contam$PCR_Result == 1 & seq_contam$SEQ_Result == 1, na.rm = TRUE)
+    FN_contam <- sum(seq_contam$PCR_Result == 1 & seq_contam$SEQ_Result == 0, na.rm = TRUE)
+    FP_contam <- sum(seq_contam$PCR_Result == 0 & seq_contam$SEQ_Result == 1, na.rm = TRUE)
+    TN_contam <- sum(seq_contam$PCR_Result == 0 & seq_contam$SEQ_Result == 0, na.rm = TRUE)
+    
+    sens_contam <- ifelse((TP_contam + FN_contam) > 0, TP_contam / (TP_contam + FN_contam), NA_real_)
+    spec_contam <- ifelse((TN_contam + FP_contam) > 0, TN_contam / (TN_contam + FP_contam), NA_real_)
+    
+    # Store results
+    results_list[[as.character(threshold)]] <- tibble(
+      Coverage_Threshold = threshold,
+      # Original
+      TP_Orig = TP_orig,
+      FN_Orig = FN_orig,
+      FP_Orig = FP_orig,
+      TN_Orig = TN_orig,
+      Sens_Orig = round(sens_orig * 100, 1),
+      Spec_Orig = round(spec_orig * 100, 1),
+      # Contam-Adjusted
+      TP_Contam = TP_contam,
+      FN_Contam = FN_contam,
+      FP_Contam = FP_contam,
+      TN_Contam = TN_contam,
+      Sens_Contam = round(sens_contam * 100, 1),
+      Spec_Contam = round(spec_contam * 100, 1)
+    )
+    
+    # Get FP and FN samples for ORIGINAL
+    fp_orig_samples <- seq_orig %>%
+      filter(PCR_Result == 0 & SEQ_Result == 1) %>%
+      select(sample_id, Pathogen, coverage_percentage, ct_values, Contam) %>%
+      mutate(Error_Type = "False Positive", Adjustment = "Original")
+    
+    fn_orig_samples <- seq_orig %>%
+      filter(PCR_Result == 1 & SEQ_Result == 0) %>%
+      select(sample_id, Pathogen, coverage_percentage, ct_values, Contam) %>%
+      mutate(Error_Type = "False Negative", Adjustment = "Original")
+    
+    # Get FP and FN samples for CONTAMINATION-ADJUSTED
+    fp_contam_samples <- seq_contam %>%
+      filter(PCR_Result == 0 & SEQ_Result == 1) %>%
+      select(sample_id, Pathogen, coverage_percentage, ct_values, Contam) %>%
+      mutate(Error_Type = "False Positive", Adjustment = "Contam-Adjusted")
+    
+    fn_contam_samples <- seq_contam %>%
+      filter(PCR_Result == 1 & SEQ_Result == 0) %>%
+      select(sample_id, Pathogen, coverage_percentage, ct_values, Contam) %>%
+      mutate(Error_Type = "False Negative", Adjustment = "Contam-Adjusted")
+    
+    # Combine and store
+    fp_samples_list[[as.character(threshold)]] <- bind_rows(fp_orig_samples, fp_contam_samples) %>%
+      mutate(Coverage_Threshold = threshold)
+    
+    fn_samples_list[[as.character(threshold)]] <- bind_rows(fn_orig_samples, fn_contam_samples) %>%
+      mutate(Coverage_Threshold = threshold)
+  }
+  
+  # Combine results
+  results_df <- bind_rows(results_list)
+  
+  # Combine all error samples
+  all_fp <- bind_rows(fp_samples_list)
+  all_fn <- bind_rows(fn_samples_list)
+  all_errors <- bind_rows(all_fp, all_fn) %>%
+    arrange(Coverage_Threshold, Error_Type, Adjustment, sample_id)
+  
+  # Create summary table (Sensitivity/Specificity only)
+  summary_table <- results_df %>%
+    mutate(
+      Original = paste0(Sens_Orig, "% / ", Spec_Orig, "%"),
+      Contam_Adjusted = paste0(Sens_Contam, "% / ", Spec_Contam, "%"),
+      Difference = paste0(round(Sens_Contam - Sens_Orig, 1), "% / ", 
+                          round(Spec_Contam - Spec_Orig, 1), "%")
+    ) %>%
+    select(
+      Coverage_Threshold,
+      Original,
+      Contam_Adjusted,
+      Difference
+    )
+  
+  # Create detailed confusion matrix table
+  detailed_table <- results_df %>%
+    mutate(
+      Orig_Matrix = paste0("TP=", TP_Orig, ", FN=", FN_Orig, ", FP=", FP_Orig, ", TN=", TN_Orig),
+      Contam_Matrix = paste0("TP=", TP_Contam, ", FN=", FN_Contam, ", FP=", FP_Contam, ", TN=", TN_Contam)
+    ) %>%
+    select(
+      Coverage_Threshold,
+      Orig_Matrix,
+      Contam_Matrix
+    )
+  
+  # Return all tables
+  return(list(
+    summary = summary_table,
+    detailed = detailed_table,
+    full_data = results_df,
+    errors = all_errors,
+    fp_samples = all_fp,
+    fn_samples = all_fn
+  ))
+}
+
+```
+
+```{r, echo=FALSE}
+# Run analyses for all datasets
+
+all_results <- map(loaded_datasets, function(ds) {
+  tryCatch({
+    list(
+      coverage = analyze_coverage(ds),
+      rpm = analyze_rpm(ds),
+      depth = analyze_depth(ds),
+      roc = generate_roc(ds)
+    )
+  }, error = function(e) {
+    warning("Analysis failed for dataset ", ds$name %||% "unknown", ": ", e$message)
+    list(
+      coverage = NULL,
+      rpm = NULL,
+      depth = NULL,
+      roc = NULL
+    )
+  })
+})
+
+# Function to calculate Ct < 30 sensitivity for ALL_COMBINED
+calculate_ct30_sensitivity <- function() {
+  if (!"ALL_COMBINED" %in% names(loaded_datasets)) {
+    return(NULL)
+  }
+  
+  ds <- loaded_datasets$ALL_COMBINED
+  
+  # Merge PCR and continuous data
+  merged_data <- inner_join(ds$pcr, ds$continuous, 
+                          by = c("sample_id", "Pathogen")) %>%
+    filter(!is.na(PCR_Result))  # Remove "Not tested"
+  
+  # Filter for Ct values < 30
+  ct30_data <- merged_data %>%
+    filter(!is.na(ct_values) & ct_values < 30 & ct_values > 0)
+  
+  # ORIGINAL (no contamination adjustment)
+  ct30_original <- ct30_data %>%
+    mutate(SEQ_Result = ifelse(coverage_percentage >= 10, 1, 0))
+  
+  TP_orig <- sum(ct30_original$PCR_Result == 1 & ct30_original$SEQ_Result == 1, na.rm = TRUE)
+  FN_orig <- sum(ct30_original$PCR_Result == 1 & ct30_original$SEQ_Result == 0, na.rm = TRUE)
+  sensitivity_orig <- ifelse((TP_orig + FN_orig) > 0, TP_orig / (TP_orig + FN_orig), NA_real_)
+  
+  # CONTAMINATION-ADJUSTED
+  ct30_contam <- ct30_data %>%
+    mutate(SEQ_Result = case_when(
+      Contam == "YES" ~ 0,  # Contaminated samples treated as negative
+      coverage_percentage >= 10 ~ 1,
+      TRUE ~ 0
+    ))
+  
+  TP_contam <- sum(ct30_contam$PCR_Result == 1 & ct30_contam$SEQ_Result == 1, na.rm = TRUE)
+  FN_contam <- sum(ct30_contam$PCR_Result == 1 & ct30_contam$SEQ_Result == 0, na.rm = TRUE)
+  sensitivity_contam <- ifelse((TP_contam + FN_contam) > 0, 
+                               TP_contam / (TP_contam + FN_contam), NA_real_)
+  
+  # Format results
+  result <- tibble(
+    Metric = c("Sensitivity at 10% (Ct <30) - Original",
+               "Sensitivity at 10% (Ct <30) - Contam Adj"),
+    Value = c(
+      ifelse(!is.na(sensitivity_orig), paste0(round(sensitivity_orig * 100, 1), "%"), "N/A"),
+      ifelse(!is.na(sensitivity_contam), paste0(round(sensitivity_contam * 100, 1), "%"), "N/A")
+    )
+  )
+  
+  return(result)
+}
+
+# Function to get PCR positive samples count for each dataset
+get_pcr_positive_samples <- function() {
+  results <- list()
+  
+  all_dataset_names <- c("PathCare", "NHLS_GS", "NHLS_TY", "Mucokids", "SUDI", "ALL_COMBINED")
+  
+  for (ds_name in all_dataset_names) {
+    if (!ds_name %in% names(loaded_datasets)) next
+    
+    ds <- loaded_datasets[[ds_name]]
+    
+    # Count unique samples with at least one PCR positive detection
+    pcr_positive_samples <- ds$pcr %>%
+      filter(PCR_Result == 1) %>%
+      distinct(sample_id) %>%
+      nrow()
+    
+    # Total unique samples in dataset
+    total_samples <- length(unique(ds$continuous$sample_id))
+    
+    # Count total PCR positive detections (observations)
+    total_detections <- ds$pcr %>%
+      filter(PCR_Result == 1) %>%
+      nrow()
+    
+    # Get list of positive samples for reference
+    positive_sample_list <- ds$pcr %>%
+      filter(PCR_Result == 1) %>%
+      distinct(sample_id) %>%
+      pull(sample_id)
+    
+    results[[ds_name]] <- list(
+      dataset = ds_name,
+      total_samples = total_samples,
+      positive_samples_count = pcr_positive_samples,
+      percent_positive = round(pcr_positive_samples / total_samples * 100, 1),
+      total_detections = total_detections,
+      positive_samples = positive_sample_list
+    )
+  }
+  
+  return(results)
+}
+
+# Function to create PCR positive counts by pathogen
+create_pcr_positive_counts <- function(dataset_name = NULL) {
+  
+  # If dataset_name is provided, only show that dataset
+  # If NULL, show all datasets including combined
+  
+  if (!is.null(dataset_name) && dataset_name %in% names(loaded_datasets)) {
+    datasets_to_process <- list(loaded_datasets[[dataset_name]])
+    names(datasets_to_process) <- dataset_name
+  } else {
+    datasets_to_process <- loaded_datasets
+  }
+  
+  results_list <- list()
+  
+  for (ds_name in names(datasets_to_process)) {
+    ds <- datasets_to_process[[ds_name]]
+    
+    # Count PCR positive per pathogen
+    pcr_positive <- ds$pcr %>%
+      filter(PCR_Result == 1) %>%
+      group_by(Pathogen) %>%
+      summarise(Positive_Count = n(), .groups = "drop") %>%
+      mutate(Dataset = ds_name)
+    
+    # Count total tested per pathogen (non-NA)
+    total_tested <- ds$pcr %>%
+      filter(!is.na(PCR_Result)) %>%
+      group_by(Pathogen) %>%
+      summarise(Total_Tested = n(), .groups = "drop") %>%
+      mutate(Dataset = ds_name)
+    
+    # Combine and calculate percentage
+    combined <- pcr_positive %>%
+      left_join(total_tested, by = c("Pathogen", "Dataset")) %>%
+      mutate(
+        Percent_Positive = round(Positive_Count / Total_Tested * 100, 1),
+        Percent_Positive_Display = paste0(Percent_Positive, "%")
+      ) %>%
+      arrange(desc(Positive_Count))
+    
+    results_list[[ds_name]] <- combined
+  }
+  
+  # Combine all results
+  all_results <- bind_rows(results_list)
+  
+  return(all_results)
+}
+
+# Function to display PCR positive counts in a formatted table
+display_pcr_positive_counts <- function(dataset_name = NULL, show_combined = TRUE) {
+  
+  # Get the data
+  pcr_data <- create_pcr_positive_counts(dataset_name)
+  
+  if (is.null(pcr_data) || nrow(pcr_data) == 0) {
+    cat("No PCR positive data available\n")
+    return(invisible(NULL))
+  }
+  
+  # If showing all datasets, split by dataset
+  if (is.null(dataset_name)) {
+    datasets_present <- unique(pcr_data$Dataset)
+    
+    for (ds in datasets_present) {
+      # Skip ALL_COMBINED if not requested
+      if (ds == "ALL_COMBINED" && !show_combined) next
+      
+      cat(paste0("\n### ", ds, "\n\n"))
+      
+      ds_data <- pcr_data %>% filter(Dataset == ds)
+      
+      # Check if there are any positives
+      if (sum(ds_data$Positive_Count) == 0) {
+        cat("*No PCR positive detections in this dataset*\n\n")
+        next
+      }
+      
+      # Create the table
+      table_data <- ds_data %>%
+        select(Pathogen, Positive_Count, Total_Tested, Percent_Positive_Display) %>%
+        mutate(
+          Pathogen = as.character(Pathogen),
+          Positive_Count = as.integer(Positive_Count),
+          Total_Tested = as.integer(Total_Tested)
+        )
+      
+      # Add a total row
+      total_row <- tibble(
+        Pathogen = "**TOTAL**",
+        Positive_Count = sum(table_data$Positive_Count),
+        Total_Tested = sum(table_data$Total_Tested),
+        Percent_Positive_Display = paste0(round(sum(table_data$Positive_Count) / sum(table_data$Total_Tested) * 100, 1), "%")
+      )
+      
+      table_data <- bind_rows(table_data, total_row)
+      
+      kable(table_data,
+            caption = paste("PCR Positive Detections -", ds),
+            col.names = c("Pathogen", "Positive", "Tested", "% Positive"),
+            escape = FALSE) %>%
+        kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+        column_spec(1, bold = TRUE) %>%
+        row_spec(nrow(table_data) - 1, bold = TRUE, background = "#FFF3CD") %>%
+        print()
+    }
+    
+    # If we have ALL_COMBINED and show_combined is TRUE, show it separately
+    if (show_combined && "ALL_COMBINED" %in% names(loaded_datasets)) {
+      cat("\n### ALL_COMBINED (All Datasets Combined)\n\n")
+      
+      combined_data <- pcr_data %>% filter(Dataset == "ALL_COMBINED")
+      
+      if (nrow(combined_data) > 0 && sum(combined_data$Positive_Count) > 0) {
+        table_data <- combined_data %>%
+          select(Pathogen, Positive_Count, Total_Tested, Percent_Positive_Display) %>%
+          mutate(
+            Pathogen = as.character(Pathogen),
+            Positive_Count = as.integer(Positive_Count),
+            Total_Tested = as.integer(Total_Tested)
+          )
+        
+        total_row <- tibble(
+          Pathogen = "**TOTAL**",
+          Positive_Count = sum(table_data$Positive_Count),
+          Total_Tested = sum(table_data$Total_Tested),
+          Percent_Positive_Display = paste0(round(sum(table_data$Positive_Count) / sum(table_data$Total_Tested) * 100, 1), "%")
+        )
+        
+        table_data <- bind_rows(table_data, total_row)
+        
+        kable(table_data,
+              caption = "PCR Positive Detections - ALL COMBINED",
+              col.names = c("Pathogen", "Positive", "Tested", "% Positive"),
+              escape = FALSE) %>%
+          kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+          column_spec(1, bold = TRUE) %>%
+          row_spec(nrow(table_data) - 1, bold = TRUE, background = "#FFF3CD") %>%
+          print()
+      } else {
+        cat("*No PCR positive detections in combined dataset*\n\n")
+      }
+    }
+    
+  } else {
+    # Single dataset
+    ds_data <- pcr_data
+    
+    if (sum(ds_data$Positive_Count) == 0) {
+      cat("*No PCR positive detections in this dataset*\n\n")
+      return(invisible(NULL))
+    }
+    
+    table_data <- ds_data %>%
+      select(Pathogen, Positive_Count, Total_Tested, Percent_Positive_Display) %>%
+      mutate(
+        Pathogen = as.character(Pathogen),
+        Positive_Count = as.integer(Positive_Count),
+        Total_Tested = as.integer(Total_Tested)
+      )
+    
+    total_row <- tibble(
+      Pathogen = "**TOTAL**",
+      Positive_Count = sum(table_data$Positive_Count),
+      Total_Tested = sum(table_data$Total_Tested),
+      Percent_Positive_Display = paste0(round(sum(table_data$Positive_Count) / sum(table_data$Total_Tested) * 100, 1), "%")
+    )
+    
+    table_data <- bind_rows(table_data, total_row)
+    
+    kable(table_data,
+          caption = paste("PCR Positive Detections -", dataset_name),
+          col.names = c("Pathogen", "Positive", "Tested", "% Positive"),
+          escape = FALSE) %>%
+      kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+      column_spec(1, bold = TRUE) %>%
+      row_spec(nrow(table_data) - 1, bold = TRUE, background = "#FFF3CD") %>%
+      print()
+  }
+}
+
+```
+
+# VirCapSeq Analysis Report  {.tabset .tabset-fade}
+
+## Dataset Summary
+
+```{r, echo=FALSE, results='asis'}
+library(dplyr)
+library(purrr)
+library(kableExtra)
+
+# Calculate overall summary metrics, including pathogens tested
+summary_data <- map_dfr(names(loaded_datasets), function(ds_name) {
+  ds <- loaded_datasets[[ds_name]]
+  
+  # Unique pathogens that were actually tested
+  tested_pathogens <- ds$pcr %>%
+    filter(!is.na(PCR_Result)) %>%
+    distinct(Pathogen) %>%
+    pull(Pathogen)
+  
+  # Calculate detected / not detected counts
+  detected_count <- sum(ds$pcr$PCR_Result == 1, na.rm = TRUE)
+  not_detected_count <- sum(ds$pcr$PCR_Result == 0, na.rm = TRUE)
+  
+  tibble(
+    Dataset = ds_name,
+    Samples = length(unique(ds$continuous$sample_id)),
+    Pathogens = length(tested_pathogens),  
+    Total_Observations = length(unique(ds$continuous$sample_id)) * length(tested_pathogens),
+    True_Total_Obs = detected_count + not_detected_count,
+    PCR_Positive = detected_count,
+    PCR_Negative = not_detected_count,
+    Not_Tested = sum(is.na(ds$pcr$PCR_Result), na.rm = TRUE),
+    Pathogens_Tested = paste(tested_pathogens, collapse = "<br>")
+  )
+})
+
+# Print summary table
+kable(summary_data, caption = "Dataset Overview", escape = FALSE, format = "html") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+# Create dataset index table
+dataset_index <- map_dfr(seq_along(datasets), function(i) {
+  tibble(
+    Index = i,
+    Name = datasets[[i]]$name,
+    Description = datasets[[i]]$description
+  )
+})
+
+kable(dataset_index, caption = "Dataset Index and Descriptions") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+
+```
+
+
+## Dataset 1: Pathcare {.tabset .tabset-fade}
+
+### Overview
+
+```{r, echo=FALSE, results='asis'}
+calculate_basic_stats <- function(dataset_name, dataset) {
+  
+  num_samples <- length(unique(dataset$continuous$sample_id))
+  
+  # Count only pathogens actually tested (exclude Not Tested)
+  tested_pathogens <- dataset$pcr %>%
+    filter(!is.na(PCR_Result)) %>%
+    distinct(Pathogen) %>%
+    pull(Pathogen)
+  num_pathogens <- length(tested_pathogens)
+  
+  total_obs <- nrow(dataset$pcr)
+  pcr_detected <- sum(dataset$pcr$PCR_Result == 1, na.rm = TRUE)
+  pcr_not_detected <- sum(dataset$pcr$PCR_Result == 0, na.rm = TRUE)
+  
+  basic_stats <- tibble(
+    Metric = c(
+      "Number of unique samples", "Number of pathogens", "Total observations",
+      "PCR detections", "PCR non-detections"
+    ),
+    Value = c(
+      num_samples, num_pathogens, total_obs, pcr_detected, pcr_not_detected
+    )
+  )
+  
+  kable(basic_stats, caption = paste("Basic Statistics for", dataset_name)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+}
+
+
+if ("PathCare" %in% names(loaded_datasets)) {
+  calculate_basic_stats("PathCare", loaded_datasets$PathCare)
+}
+```
+
+### Performance
+
+```{r, echo=FALSE, results='asis'}
+create_summary_tables <- function(dataset_name) {
+  ALL_cols <- c("Threshold", "TP", "FN", "FP", "TN", "Sensitivity", "Specificity")
+  
+  if (!is.null(all_results[[dataset_name]]$coverage$results)) {
+    cat("#### Coverage Threshold Performance\n")
+    kable(all_results[[dataset_name]]$coverage$results %>% select(all_of(ALL_cols)),
+          caption = "Coverage Threshold Performance") %>% 
+      kable_styling() %>% 
+      print()
+  }
+  
+  if (!is.null(all_results[[dataset_name]]$rpm$results)) {
+    cat("\n#### RPM Threshold Performance\n")
+    kable(all_results[[dataset_name]]$rpm$results %>% select(all_of(ALL_cols)),
+          caption = "RPM Threshold Performance") %>% 
+      kable_styling() %>% 
+      print()
+  }
+  
+  if (!is.null(all_results[[dataset_name]]$depth$results)) {
+    cat("\n#### Depth Threshold Performance\n")
+    kable(all_results[[dataset_name]]$depth$results %>% select(all_of(ALL_cols)),
+          caption = "Depth Threshold Performance") %>% 
+      kable_styling() %>% 
+      print()
+  }
+}
+
+if ("PathCare" %in% names(loaded_datasets)) {
+  create_summary_tables("PathCare")
+}
+```
+
+### Plots
+
+```{r, echo=FALSE, results='asis', fig.height=15, fig.width=11}
+custom_theme <- function(base_size = 14) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+      axis.title = element_text(size = 16, face = "bold"),
+      axis.text = element_text(size = 14),
+      legend.title = element_text(face = "bold"),
+      legend.position = "bottom",
+      panel.grid.major = element_line(color = "grey90"),
+      panel.grid.minor = element_blank()
+    )
+}
+
+if ("PathCare" %in% names(loaded_datasets)) {
+  PathCare_data <- inner_join(
+    loaded_datasets$PathCare$pcr,
+    loaded_datasets$PathCare$continuous,
+    by = c("sample_id", "Pathogen")
+  ) %>%
+    filter(!is.na(ct_values) & ct_values > 0)
+  
+  
+  pathogen_colors <- c("#1F77B4", "#2CA02C", "#D62728", "#9467BD", "#8C564B", "#E377C2", "#E38031", "#31CBE3")
+  
+  p1 <- ggplot(PathCare_data, aes(x = ct_values, y = coverage_percentage, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) +
+    labs(title = "Coverage vs CT Values", x = "CT Value", y = "Coverage Percentage (%)") +
+    custom_theme() + scale_color_manual(values = pathogen_colors) +
+    scale_y_continuous(
+    labels = scales::percent_format(scale = 1),
+    breaks = seq(0, 100, by = 10)  # goes 0%, 10%, 20%, ... 100%
+  )
+  
+  p2 <- ggplot(PathCare_data, aes(x = ct_values, y = rpm, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) +
+    labs(title = "RPM vs CT Values", x = "CT Value", y = "Reads Per Million (RPM)") +
+    custom_theme() + scale_color_manual(values = pathogen_colors) + scale_y_log10()
+  
+  p3 <- ggplot(PathCare_data, aes(x = ct_values, y = depth_of_coverage, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) +
+    labs(title = "Depth vs CT Values", x = "CT Value", y = "Depth of Coverage") +
+    custom_theme() + scale_color_manual(values = pathogen_colors) + scale_y_log10()
+  
+  # Combine plots
+  combined <- (p1 + p2 + p3) + 
+  plot_layout(ncol = 1, guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 10),
+    legend.key.size = unit(1, "cm")  # adjust spacing around legend symbols
+  )
+  
+  print(combined)
+}
+```
+
+### ROC curves
+
+```{r, echo=FALSE, results='asis'}
+
+create_roc_plots <- function(dataset_name, save_plot = FALSE) {
+  ds <- loaded_datasets[[dataset_name]]
+  roc_data <- inner_join(ds$pcr, ds$continuous, by = c("sample_id", "Pathogen")) %>%
+    filter(!is.na(PCR_Result))
+  
+  if (nrow(roc_data) == 0 || length(unique(roc_data$PCR_Result)) != 2) {
+    cat("Not enough data for ROC analysis\n")
+    return()
+  }
+  
+  roc_coverage <- roc(PCR_Result ~ coverage_percentage, data = roc_data)
+  roc_rpm <- roc(PCR_Result ~ rpm, data = roc_data)
+  roc_depth <- roc(PCR_Result ~ depth_of_coverage, data = roc_data)
+  
+  performance_summary <- tibble(
+    Metric = c("Genome coverage", "RPM", "Depth"),
+    AUC = c(auc(roc_coverage), auc(roc_rpm), auc(roc_depth))
+  )
+  
+  kable(performance_summary, caption = "ROC Performance Metrics") %>% 
+    kable_styling() %>% 
+    print()
+  
+  # Put Genome coverage LAST → it will be drawn on TOP
+  roc_list <- list(
+    RPM = roc_rpm,
+    Depth = roc_depth,
+    `Genome coverage` = roc_coverage
+  )
+  
+  legend_order <- c("Depth", "Genome coverage", "RPM")
+  
+  p <- ggroc(roc_list, legacy.axes = TRUE, size = 1.2) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+    labs(
+      title = NULL,  
+      subtitle = paste(
+        "Depth AUC =", round(auc(roc_depth), 3),
+        "| Genome coverage AUC =", round(auc(roc_coverage), 3), 
+        "| RPM AUC =", round(auc(roc_rpm), 3)
+      ),
+      x = "False Positive Rate (1 - Specificity)",
+      y = "True Positive Rate (Sensitivity)"
+    ) +
+    theme_minimal(base_size = 14) +
+    scale_color_manual(
+      name = "Metric",
+      values = c(
+        "Depth" = "#B831E3",
+        "Genome coverage" = "#E38031", 
+        "RPM" =  "#31E3B7"
+      ),
+      breaks = legend_order,  
+      labels = legend_order   
+    ) +
+    theme(
+      legend.position = "bottom",
+      legend.text = element_text(size = 16),
+      legend.title = element_text(size = 18),
+      axis.title = element_text(size = 18),
+      axis.text = element_text(size = 13),
+      plot.subtitle = element_text(size = 18),
+      panel.grid.major = element_line(color = "gray90", linewidth = 0.5),
+      panel.grid.minor = element_line(color = "gray95", linewidth = 0.25)
+    )
+  
+  print(p)
+  
+  if (save_plot) {
+    if (!dir.exists("figures")) dir.create("figures")
+    outfile <- paste0("figures/ROC_", dataset_name, ".png")
+    
+    # Save with explicit sizes
+    ggsave(
+      filename = outfile,
+      plot = p,
+      width = 10,      # inches
+      height = 7,      # inches
+      dpi = 300,
+      bg = "white"     # Ensure white background
+    )
+    
+    cat("Plot saved to:", outfile, "\n")
+  }
+  
+  return(p)
+}
+
+
+if ("PathCare" %in% names(loaded_datasets)) {
+  create_roc_plots("PathCare", save_plot = TRUE)
+}
+```
+
+```{r, echo=FALSE, results='asis'}
+# Function to analyze coverage thresholds with Ct filtering
+analyze_coverage_ct_filter <- function(dataset, ct_threshold = 30) {
+  if (!all(c("pcr", "continuous") %in% names(dataset))) {
+    return(list(results = NULL, fn_samples = list(), fp_samples = list()))
+  }
+  
+  coverage_thresholds <- c(10, 20, 50, 80, 90)
+  results <- list()
+  fn_samples <- list()
+  fp_samples <- list()
+  
+  merged_data <- inner_join(dataset$pcr, dataset$continuous, 
+                          by = c("sample_id", "Pathogen"))
+  
+  # Filter data to include only samples with Ct values < threshold
+  filtered_data <- merged_data %>%
+    filter(!is.na(ct_values) & ct_values < ct_threshold & ct_values > 0)
+  
+  for (threshold in coverage_thresholds) {
+    threshold_label <- paste0("cov", threshold)
+    
+    seq_data <- filtered_data %>%
+      mutate(SEQ_Result = ifelse(coverage_percentage >= threshold, 1, 0))
+    
+    # Confusion matrix calculations
+    TP <- sum(seq_data$PCR_Result == 1 & seq_data$SEQ_Result == 1, na.rm = TRUE)
+    TN <- sum(seq_data$PCR_Result == 0 & seq_data$SEQ_Result == 0, na.rm = TRUE)
+    FP <- sum(seq_data$PCR_Result == 0 & seq_data$SEQ_Result == 1, na.rm = TRUE)
+    FN <- sum(seq_data$PCR_Result == 1 & seq_data$SEQ_Result == 0, na.rm = TRUE)
+    
+    sensitivity <- ifelse((TP + FN) > 0, TP / (TP + FN), NA_real_)
+    specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), NA_real_)
+    
+    results[[threshold_label]] <- tibble(
+      Threshold = threshold_label,
+      Ct_Filter = paste0("Ct <", ct_threshold),
+      TP = TP, FN = FN, FP = FP, TN = TN,
+      Sensitivity = round(sensitivity, 3),
+      Specificity = round(specificity, 3)
+    )
+    
+    fn_samples[[threshold_label]] <- seq_data %>%
+      filter(PCR_Result == 1 & SEQ_Result == 0) %>%
+      select(sample_id, Pathogen, PCR_Result, SEQ_Result, coverage_percentage, depth_of_coverage, ct_values)
+    
+    fp_samples[[threshold_label]] <- seq_data %>%
+      filter(PCR_Result == 0 & SEQ_Result == 1) %>%
+      select(sample_id, Pathogen, PCR_Result, SEQ_Result, coverage_percentage, depth_of_coverage, ct_values)
+  }
+  
+  list(
+    results = bind_rows(results),
+    fn_samples = fn_samples,
+    fp_samples = fp_samples
+  )
+}
+
+# Function to analyze RPM thresholds with Ct filtering
+analyze_rpm_ct_filter <- function(dataset, ct_threshold = 30) {
+  if (!all(c("pcr", "continuous") %in% names(dataset))) {
+    return(list(results = NULL, fn_samples = list(), fp_samples = list()))
+  }
+  
+  rpm_thresholds <- c(10, 100, 500, 1000)
+  results <- list()
+  fn_samples <- list()
+  fp_samples <- list()
+  
+  merged_data <- inner_join(dataset$pcr, dataset$continuous, 
+                          by = c("sample_id", "Pathogen"))
+  
+  # Filter data to include only samples with Ct values > threshold
+  filtered_data <- merged_data %>%
+    filter(!is.na(ct_values) & ct_values < ct_threshold & ct_values > 0)
+  
+  for (threshold in rpm_thresholds) {
+    threshold_label <- paste0("rpm", threshold)
+    
+    seq_data <- filtered_data %>%
+      mutate(SEQ_Result = ifelse(rpm >= threshold, 1, 0))
+    
+    # Confusion matrix calculations
+    TP <- sum(seq_data$PCR_Result == 1 & seq_data$SEQ_Result == 1, na.rm = TRUE)
+    TN <- sum(seq_data$PCR_Result == 0 & seq_data$SEQ_Result == 0, na.rm = TRUE)
+    FP <- sum(seq_data$PCR_Result == 0 & seq_data$SEQ_Result == 1, na.rm = TRUE)
+    FN <- sum(seq_data$PCR_Result == 1 & seq_data$SEQ_Result == 0, na.rm = TRUE)
+    
+    sensitivity <- ifelse((TP + FN) > 0, TP / (TP + FN), NA_real_)
+    specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), NA_real_)
+    
+    results[[threshold_label]] <- tibble(
+      Threshold = threshold_label,
+      Ct_Filter = paste0("Ct <", ct_threshold),
+      TP = TP, FN = FN, FP = FP, TN = TN,
+      Sensitivity = round(sensitivity, 3),
+      Specificity = round(specificity, 3)
+    )
+    
+    fn_samples[[threshold_label]] <- seq_data %>%
+      filter(PCR_Result == 1 & SEQ_Result == 0) %>%
+      select(sample_id, Pathogen, PCR_Result, SEQ_Result, rpm, depth_of_coverage, ct_values)
+    
+    fp_samples[[threshold_label]] <- seq_data %>%
+      filter(PCR_Result == 0 & SEQ_Result == 1) %>%
+      select(sample_id, Pathogen, PCR_Result, SEQ_Result, rpm, depth_of_coverage, ct_values)
+  }
+  
+  list(
+    results = bind_rows(results),
+    fn_samples = fn_samples,
+    fp_samples = fp_samples
+  )
+}
+
+# Run analysis with Ct < 30 filter
+# Re-run ct_filter_results to include ALL_COMBINED dataset
+ct_filter_results <- map(loaded_datasets, function(ds) {
+  tryCatch({
+    list(
+      coverage = analyze_coverage_ct_filter(ds, ct_threshold = 30),
+      rpm = analyze_rpm_ct_filter(ds, ct_threshold = 30)
+    )
+  }, error = function(e) {
+    warning("Ct filter analysis failed for dataset: ", e$message)
+    list(coverage = NULL, rpm = NULL)
+  })
+})
+
+```
+
+
+```{r, echo=FALSE, results='asis'}
+List_of_sample_in_red <- c("C069864")
+
+create_fn_fp <- function(dataset_name) {
+  ds_results <- all_results[[dataset_name]]
+  
+  process_samples <- function(sample_list, type, metric) {
+    if (is.null(sample_list) || length(sample_list) == 0) {
+      cat(paste0("\n#### No ", type, " Samples found for ", metric, " metric\n"))
+      return(invisible(NULL))
+    }
+    
+    all_samples <- tibble()
+    already_seen <- tibble(sample_id = character(), Pathogen = character())
+
+    for (thresh in names(sample_list)) {
+      current <- sample_list[[thresh]]
+      if (is.null(current) || nrow(current) == 0) next
+      
+      # Filter: remove NA ct_values and only keep ct_values < 30
+      current <- current %>% 
+        filter(!is.na(ct_values) & ct_values < 30 & ct_values > 0) %>% 
+        mutate(Threshold = thresh)
+      
+      # Skip if no rows remain after filtering
+      if (nrow(current) == 0) next
+      
+      new_samples <- anti_join(current, already_seen, by = c("sample_id", "Pathogen"))
+      already_seen <- bind_rows(already_seen, new_samples %>% select(sample_id, Pathogen))
+      
+      if (nrow(new_samples) > 0) {
+        enriched <- new_samples %>%
+          mutate(Metric = metric)
+        
+        all_samples <- bind_rows(all_samples, enriched)
+      }
+    }
+
+    if (nrow(all_samples) > 0) {
+      cat(paste0("\n#### ", type, " Samples (", metric, ")\n"))
+      
+      # Define column order
+      preferred_order <- c("sample_id", "Pathogen", "PCR_Result", "SEQ_Result", "Threshold", 
+                          "coverage_percentage", "rpm", "depth_of_coverage", "ct_values")
+      
+      # Create the table
+      table_data <- all_samples %>% 
+        select(any_of(preferred_order)) %>% 
+        arrange(Threshold, Pathogen, sample_id)
+      
+      # Create kable object
+      kable_obj <- kable(table_data,
+                        caption = paste(type, "samples for", dataset_name, "(", metric, ")")) %>% 
+        kable_styling()
+      
+      # Apply red color to sample IDs that are in the predefined list
+      if (length(List_of_sample_in_red) > 0) {
+        error_rows <- which(table_data$sample_id %in% List_of_sample_in_red)
+        if (length(error_rows) > 0) {
+          kable_obj <- kable_obj %>%
+            row_spec(error_rows, color = "red", bold = TRUE)
+        }
+      }
+      
+      print(kable_obj)
+      
+    } else {
+      cat(paste0("\n#### No ", type, " Samples found for ", metric, " metric\n"))
+    }
+  }
+  
+  # Process metrics
+  if (!is.null(ds_results$coverage)) {
+    process_samples(ds_results$coverage$fn_samples, "False Negatives", "coverage")
+    process_samples(ds_results$coverage$fp_samples, "False Positives", "coverage")
+  }
+  
+  if (!is.null(ds_results$rpm)) {
+    process_samples(ds_results$rpm$fn_samples, "False Negatives", "rpm")
+    process_samples(ds_results$rpm$fp_samples, "False Positives", "rpm")
+  }
+}
+```
+
+```{r, echo=FALSE, results='asis'}
+
+#if ("PathCare" %in% names(loaded_datasets)) {
+#  create_fn_fp("PathCare")
+#}
+```
+
+
+### CT Threshold 
+
+```{r, echo=FALSE, results='asis'}
+# Display results
+cat('#### Coverage Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$PathCare$coverage$results)) {
+  kable(ct_filter_results$PathCare$coverage$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "Coverage Analysis with Ct < 30 Filter") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+
+cat('\n#### RPM Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$PathCare$rpm$results)) {
+  kable(ct_filter_results$PathCare$rpm$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "RPM Analysis with Ct < 30 Filter") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+```
+
+### Error Analysis <30 Coverage
+
+```{r, echo=FALSE, results='asis'}
+if ("PathCare" %in% names(loaded_datasets)) {
+  create_fn_fp("PathCare")
+}
+```
+
+## Dataset 2: NHLS GS {.tabset .tabset-fade}
+
+### Overview
+
+```{r, echo=FALSE, results='asis'}
+calculate_basic_stats <- function(dataset_name, dataset) {
+  num_samples <- length(unique(dataset$continuous$sample_id))
+  
+  # Count only pathogens actually tested (exclude Not Tested)
+  tested_pathogens <- dataset$pcr %>%
+    filter(!is.na(PCR_Result)) %>%
+    distinct(Pathogen) %>%
+    pull(Pathogen)
+  num_pathogens <- length(tested_pathogens)
+  
+  total_obs <- nrow(dataset$pcr)
+  pcr_detected <- sum(dataset$pcr$PCR_Result == 1, na.rm = TRUE)
+  pcr_not_detected <- sum(dataset$pcr$PCR_Result == 0, na.rm = TRUE)
+  
+  basic_stats <- tibble(
+    Metric = c(
+      "Number of unique samples", "Number of pathogens", "Total observations",
+      "PCR detections", "PCR non-detections"
+    ),
+    Value = c(
+      num_samples, num_pathogens, total_obs, pcr_detected, pcr_not_detected
+    )
+  )
+  
+  kable(basic_stats, caption = paste("Basic Statistics for", dataset_name)) %>% 
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+}
+
+
+if ("NHLS_GS" %in% names(loaded_datasets)) {
+  calculate_basic_stats("NHLS_GS", loaded_datasets$NHLS_GS)
+}
+```
+
+### Performance
+
+```{r, echo=FALSE, results='asis'}
+create_summary_tables <- function(dataset_name) {
+  ALL_cols <- c("Threshold", "TP", "FN", "FP", "TN", "Sensitivity", "Specificity")
+  
+  if (!is.null(all_results[[dataset_name]]$coverage$results)) {
+    cat("#### Coverage Threshold Performance\n")
+    kable(all_results[[dataset_name]]$coverage$results %>% select(all_of(ALL_cols)),
+          caption = "Coverage Threshold Performance") %>% 
+      kable_styling() %>% 
+      print()
+  }
+  
+  if (!is.null(all_results[[dataset_name]]$rpm$results)) {
+    cat("\n#### RPM Threshold Performance\n")
+    kable(all_results[[dataset_name]]$rpm$results %>% select(all_of(ALL_cols)),
+          caption = "RPM Threshold Performance") %>% 
+      kable_styling() %>% 
+      print()
+  }
+  
+  if (!is.null(all_results[[dataset_name]]$depth$results)) {
+    cat("\n#### Depth Threshold Performance\n")
+    kable(all_results[[dataset_name]]$depth$results %>% select(all_of(ALL_cols)),
+          caption = "Depth Threshold Performance") %>% 
+      kable_styling() %>% 
+      print()
+  }
+}
+
+if ("NHLS_GS" %in% names(loaded_datasets)) {
+  create_summary_tables("NHLS_GS")
+}
+```
+
+### Plots (Ct-values)
+
+```{r, echo=FALSE, results='asis', fig.height=18, fig.width=11}
+
+if ("NHLS_GS" %in% names(loaded_datasets)) {
+  NHLS_GS_data <- inner_join(
+    loaded_datasets$NHLS_GS$pcr,
+    loaded_datasets$NHLS_GS$continuous,
+    by = c("sample_id", "Pathogen")
+  ) %>%
+  filter((!is.na(ct_values) & ct_values > 0))
+
+  # Create regular CT value plots
+  p1 <- ggplot(NHLS_GS_data, aes(x = ct_values, y = coverage_percentage, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "Coverage vs CT Values", x = "CT Value", y = "Coverage Percentage (%)") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + 
+    scale_y_continuous(labels = scales::percent_format(scale = 1))
+  
+  p2 <- ggplot(NHLS_GS_data, aes(x = ct_values, y = rpm, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "RPM vs CT Values", x = "CT Value", y = "Reads Per Million (RPM)") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + scale_y_log10()
+  
+  p3 <- ggplot(NHLS_GS_data, aes(x = ct_values, y = depth_of_coverage, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "Depth vs CT Values", x = "CT Value", y = "Depth of Coverage") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + scale_y_log10()
+  
+    combined <- (p1 + p2 + p3) + 
+      plot_layout(ncol = 1, guides = "collect") &
+      theme(
+        legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 10),
+        legend.key.size = unit(1, "cm")
+      )
+  
+  print(combined)
+}
+```
+
+### ROC curves
+
+```{r, echo=FALSE, results='asis'}
+
+if ("NHLS_GS" %in% names(loaded_datasets)) {
+  create_roc_plots("NHLS_GS", save_plot = FALSE)
+}
+```
+
+### CT Threshold 
+
+```{r, echo=FALSE, results='asis'}
+# Display results
+cat('#### Coverage Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$NHLS_GS$coverage$results)) {
+  kable(ct_filter_results$NHLS_GS$coverage$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "Coverage Analysis with Ct < 30 Filter") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+
+cat('\n#### RPM Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$NHLS_GS$rpm$results)) {
+  kable(ct_filter_results$NHLS_GS$rpm$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "RPM Analysis with Ct < 30 Filter") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+```
+
+### Error Analysis <30 Coverage
+
+```{r, echo=FALSE, results='asis'}
+if ("NHLS_GS" %in% names(loaded_datasets)) {
+  create_fn_fp("NHLS_GS")
+}
+```
+
+## Dataset 3: NHLS TY {.tabset .tabset-fade}
+
+### Overview
+
+```{r, echo=FALSE, results='asis'}
+
+if ("NHLS_TY" %in% names(loaded_datasets)) {
+  calculate_basic_stats("NHLS_TY", loaded_datasets$NHLS_TY)
+}
+```
+
+### Performance
+
+```{r, echo=FALSE, results='asis'}
+
+if ("NHLS_TY" %in% names(loaded_datasets)) {
+  create_summary_tables("NHLS_TY")
+}
+```
+
+### Plots (Ct-values)
+
+```{r, echo=FALSE, results='asis', fig.height=18, fig.width=11}
+
+if ("NHLS_TY" %in% names(loaded_datasets)) {
+  NHLS_TY_data <- inner_join(
+    loaded_datasets$NHLS_TY$pcr,
+    loaded_datasets$NHLS_TY$continuous,
+    by = c("sample_id", "Pathogen")
+  ) %>%
+  filter((!is.na(ct_values) & ct_values > 0))
+
+  # Create regular CT value plots
+  p1 <- ggplot(NHLS_TY_data, aes(x = ct_values, y = coverage_percentage, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "Coverage vs CT Values", x = "CT Value", y = "Coverage Percentage (%)") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + 
+    scale_y_continuous(labels = scales::percent_format(scale = 1))
+  
+  p2 <- ggplot(NHLS_TY_data, aes(x = ct_values, y = rpm, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "RPM vs CT Values", x = "CT Value", y = "Reads Per Million (RPM)") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + scale_y_log10()
+  
+  p3 <- ggplot(NHLS_TY_data, aes(x = ct_values, y = depth_of_coverage, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "Depth vs CT Values", x = "CT Value", y = "Depth of Coverage") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + scale_y_log10()
+  
+    combined <- (p1 + p2 + p3) + 
+      plot_layout(ncol = 1, guides = "collect") &
+      theme(
+        legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 10),
+        legend.key.size = unit(1, "cm")
+      )
+  
+  print(combined)
+}
+```
+
+### ROC curves
+
+```{r, echo=FALSE, results='asis'}
+
+if ("NHLS_TY" %in% names(loaded_datasets)) {
+  create_roc_plots("NHLS_TY", save_plot = FALSE)
+}
+```
+
+### CT Threshold 
+
+```{r, echo=FALSE, results='asis'}
+# Display results
+cat('#### Coverage Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$NHLS_TY$coverage$results)) {
+  kable(ct_filter_results$NHLS_TY$coverage$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "Coverage Analysis with Ct < 30 Filter") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+
+cat('\n#### RPM Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$NHLS_TY$rpm$results)) {
+  kable(ct_filter_results$NHLS_TY$rpm$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "RPM Analysis with Ct < 30 Filter") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+```
+
+### Error Analysis <30 Coverage
+
+```{r, echo=FALSE, results='asis'}
+if ("NHLS_TY" %in% names(loaded_datasets)) {
+  create_fn_fp("NHLS_TY")
+}
+```
+
+## Dataset 4: Mucokids {.tabset .tabset-fade}
+
+### Overview
+
+```{r, echo=FALSE, results='asis'}
+
+if ("Mucokids" %in% names(loaded_datasets)) {
+  calculate_basic_stats("Mucokids", loaded_datasets$Mucokids)
+}
+```
+
+### Performance
+
+```{r, echo=FALSE, results='asis'}
+
+if ("Mucokids" %in% names(loaded_datasets)) {
+  create_summary_tables("Mucokids")
+}
+```
+
+### Plots (Ct-values)
+
+```{r, echo=FALSE, results='asis', fig.height=18, fig.width=11}
+
+if ("Mucokids" %in% names(loaded_datasets)) {
+  Mucokids_data <- inner_join(
+    loaded_datasets$Mucokids$pcr,
+    loaded_datasets$Mucokids$continuous,
+    by = c("sample_id", "Pathogen")
+  ) %>%
+  filter((!is.na(ct_values) & ct_values > 0))
+
+  # Create regular CT value plots
+  p1 <- ggplot(Mucokids_data, aes(x = ct_values, y = coverage_percentage, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "Coverage vs CT Values", x = "CT Value", y = "Coverage Percentage (%)") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + 
+    scale_y_continuous(labels = scales::percent_format(scale = 1))
+  
+  p2 <- ggplot(Mucokids_data, aes(x = ct_values, y = rpm, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "RPM vs CT Values", x = "CT Value", y = "Reads Per Million (RPM)") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + scale_y_log10()
+  
+  p3 <- ggplot(Mucokids_data, aes(x = ct_values, y = depth_of_coverage, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "Depth vs CT Values", x = "CT Value", y = "Depth of Coverage") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + scale_y_log10()
+  
+    combined <- (p1 + p2 + p3) + 
+      plot_layout(ncol = 1, guides = "collect") &
+      theme(
+        legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 10),
+        legend.key.size = unit(1, "cm")
+      )
+  
+  print(combined)
+}
+```
+
+### ROC curves
+
+```{r, echo=FALSE, results='asis'}
+
+if ("Mucokids" %in% names(loaded_datasets)) {
+  create_roc_plots("Mucokids", save_plot = FALSE)
+}
+```
+
+### CT Threshold 
+
+```{r, echo=FALSE, results='asis'}
+# Display results
+cat('#### Coverage Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$Mucokids$coverage$results)) {
+  kable(ct_filter_results$Mucokids$coverage$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "Coverage Analysis with Ct < 30 Filter") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+
+cat('\n#### RPM Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$Mucokids$rpm$results)) {
+  kable(ct_filter_results$Mucokids$rpm$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "RPM Analysis with Ct < 30 Filter") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+```
+
+### Error Analysis <30 Coverage
+
+```{r, echo=FALSE, results='asis'}
+if ("Mucokids" %in% names(loaded_datasets)) {
+  create_fn_fp("Mucokids")
+}
+```
+
+## Dataset 5: SUDI {.tabset .tabset-fade}
+
+### Overview
+
+```{r, echo=FALSE, results='asis'}
+
+if ("SUDI" %in% names(loaded_datasets)) {
+  calculate_basic_stats("SUDI", loaded_datasets$SUDI)
+}
+```
+
+### Performance
+
+```{r, echo=FALSE, results='asis'}
+
+if ("SUDI" %in% names(loaded_datasets)) {
+  create_summary_tables("SUDI")
+}
+```
+
+### Plots (Ct-values)
+
+```{r, echo=FALSE, results='asis', fig.height=18, fig.width=11}
+
+if ("SUDI" %in% names(loaded_datasets)) {
+  SUDI_data <- inner_join(
+    loaded_datasets$SUDI$pcr,
+    loaded_datasets$SUDI$continuous,
+    by = c("sample_id", "Pathogen")
+  ) %>%
+  filter((!is.na(ct_values) & ct_values > 0))
+
+  # Create regular CT value plots
+  p1 <- ggplot(SUDI_data, aes(x = ct_values, y = coverage_percentage, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "Coverage vs CT Values", x = "CT Value", y = "Coverage Percentage (%)") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + 
+    scale_y_continuous(labels = scales::percent_format(scale = 1))
+  
+  p2 <- ggplot(SUDI_data, aes(x = ct_values, y = rpm, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "RPM vs CT Values", x = "CT Value", y = "Reads Per Million (RPM)") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + scale_y_log10()
+  
+  p3 <- ggplot(SUDI_data, aes(x = ct_values, y = depth_of_coverage, color = Pathogen)) +
+    geom_point(size = 4, alpha = 0.7) + 
+    labs(title = "Depth vs CT Values", x = "CT Value", y = "Depth of Coverage") +
+    custom_theme() + scale_color_brewer(palette = "Set1") + scale_y_log10()
+  
+    combined <- (p1 + p2 + p3) + 
+      plot_layout(ncol = 1, guides = "collect") &
+      theme(
+        legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 10),
+        legend.key.size = unit(1, "cm")
+      )
+  
+  print(combined)
+}
+```
+
+### ROC curves
+
+```{r, echo=FALSE, results='asis'}
+
+if ("SUDI" %in% names(loaded_datasets)) {
+  create_roc_plots("SUDI", save_plot = FALSE)
+}
+```
+
+### CT Threshold 
+
+```{r, echo=FALSE, results='asis'}
+# Display results
+cat('#### Coverage Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$SUDI$coverage$results)) {
+  kable(ct_filter_results$SUDI$coverage$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "Coverage Analysis with Ct < 30 Filter") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+
+cat('\n#### RPM Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$SUDI$rpm$results)) {
+  kable(ct_filter_results$SUDI$rpm$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "RPM Analysis with Ct < 30 Filter") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+```
+
+### Error Analysis <30 Coverage
+
+```{r, echo=FALSE, results='asis'}
+if ("SUDI" %in% names(loaded_datasets)) {
+  create_fn_fp("SUDI")
+}
+```
+
+## Dataset 6: ALL Samples {.tabset .tabset-fade}
+
+### Overview
+
+```{r, echo=FALSE, results='asis'}
+
+if ("ALL_COMBINED" %in% names(loaded_datasets)) {
+  calculate_basic_stats("ALL_COMBINED", loaded_datasets$ALL_COMBINED)
+}
+```
+
+### Performance
+
+```{r, echo=FALSE, results='asis'}
+
+if ("ALL_COMBINED" %in% names(loaded_datasets)) {
+  create_summary_tables("ALL_COMBINED")
+}
+```
+
+### Plots (Ct-values)
+
+```{r, echo=FALSE, results='asis', fig.height=18, fig.width=11}
+
+if ("ALL_COMBINED" %in% names(loaded_datasets)) {
+  ALL_COMBINED_data <- inner_join(
+    loaded_datasets$ALL_COMBINED$pcr,
+    loaded_datasets$ALL_COMBINED$continuous,
+    by = c("sample_id", "Pathogen")
+  ) %>%
+  filter((!is.na(ct_values) & ct_values > 0))
+
+  # Create regular CT value plots
+  p1 <- ggplot(ALL_COMBINED_data, aes(x = ct_values, y = coverage_percentage, color = Pathogen)) +
+    geom_point(size = 3, alpha = 0.5) + 
+    labs(title = "Coverage vs CT Values - ALL COMBINED", x = "CT Value", y = "Coverage Percentage (%)") +
+    custom_theme() + 
+    scale_color_brewer(palette = "Set1") + 
+    scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+    theme(legend.position = "none")  # Remove legend for cleaner plot
+  
+  p2 <- ggplot(ALL_COMBINED_data, aes(x = ct_values, y = rpm, color = Pathogen)) +
+    geom_point(size = 3, alpha = 0.5) + 
+    labs(title = "RPM vs CT Values - ALL COMBINED", x = "CT Value", y = "Reads Per Million (RPM)") +
+    custom_theme() + 
+    scale_color_brewer(palette = "Set1") + 
+    scale_y_log10() +
+    theme(legend.position = "none")
+  
+  p3 <- ggplot(ALL_COMBINED_data, aes(x = ct_values, y = depth_of_coverage, color = Pathogen)) +
+    geom_point(size = 3, alpha = 0.5) + 
+    labs(title = "Depth vs CT Values - ALL COMBINED", x = "CT Value", y = "Depth of Coverage") +
+    custom_theme() + 
+    scale_color_brewer(palette = "Set1") + 
+    scale_y_log10() +
+    theme(legend.position = "bottom",
+          legend.text = element_text(size = 7),
+          legend.title = element_text(size = 9))
+  
+  combined <- (p1 + p2 + p3) + 
+    plot_layout(ncol = 1, guides = "collect") &
+    theme(legend.position = "bottom")
+  
+  print(combined)
+}
+```
+
+### ROC curves
+
+```{r, echo=FALSE, results='asis'}
+
+if ("ALL_COMBINED" %in% names(loaded_datasets)) {
+  create_roc_plots("ALL_COMBINED", save_plot = TRUE)
+}
+```
+
+### CT Threshold 
+
+```{r, echo=FALSE, results='asis'}
+# Display results
+cat('#### Coverage Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$ALL_COMBINED$coverage$results)) {
+  kable(ct_filter_results$ALL_COMBINED$coverage$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "Coverage Analysis with Ct < 30 Filter - ALL COMBINED") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+
+cat('\n#### RPM Performance (Ct < 30) & removed CT if NA \n\n')
+if (!is.null(ct_filter_results$ALL_COMBINED$rpm$results)) {
+  kable(ct_filter_results$ALL_COMBINED$rpm$results %>% 
+         select(Threshold, TP, FN, Sensitivity),
+       caption = "RPM Analysis with Ct < 30 Filter - ALL COMBINED") %>% 
+    kable_styling(bootstrap_options = c("striped", "hover")) %>%
+    print()
+}
+```
+
+### Error Analysis <30 Coverage
+
+```{r, echo=FALSE, results='asis'}
+if ("ALL_COMBINED" %in% names(loaded_datasets)) {
+  create_fn_fp("ALL_COMBINED")
+}
+```
+
+## Cross-Dataset Analysis {.tabset .tabset-fade .tabset-pills}
+
+
+```{r, echo=FALSE, results='asis',fig.height=12, fig.width=8}
+# Combine all datasets for comparative analysis (including ALL_COMBINED)
+combined_data <- imap_dfr(loaded_datasets, ~{
+  inner_join(.x$pcr, .x$continuous, by = c("sample_id", "Pathogen")) %>%
+    filter(!is.na(ct_values) & ct_values > 0) %>%
+    mutate(Dataset = .y)
+})
+
+# Update dataset colors to include ALL_COMBINED
+dataset_colors <- c("PathCare" = "#1F77B4", "NHLS_GS" = "#2CA02C", "NHLS_TY" = "#D62728", 
+                    "Mucokids" = "#EE27F5", "SUDI" = "lightgreen")  # Deep pink for combined
+
+# Create comparative plots
+p1 <- ggplot(combined_data, aes(x = ct_values, y = coverage_percentage, color = Dataset)) +
+  geom_point(size = 2, alpha = 0.4) + 
+  labs(title = "Coverage vs CT Values - All Datasets", 
+       x = "CT Value", y = "Coverage Percentage (%)") +
+  theme_minimal() + 
+  scale_color_manual(values = dataset_colors) +
+  scale_y_continuous(labels = scales::percent_format(scale = 1))
+
+p2 <- ggplot(combined_data, aes(x = ct_values, y = rpm, color = Dataset)) +
+  geom_point(size = 2, alpha = 0.4) + 
+  labs(title = "RPM vs CT Values - All Datasets", 
+       x = "CT Value", y = "Reads Per Million (RPM)") +
+  theme_minimal() + 
+  scale_color_manual(values = dataset_colors) + 
+  scale_y_log10()
+
+p3 <- ggplot(combined_data, aes(x = ct_values, y = depth_of_coverage, color = Dataset)) +
+  geom_point(size = 2, alpha = 0.4) + 
+  labs(title = "Depth vs CT Values - All Datasets", 
+       x = "CT Value", y = "Depth of Coverage") +
+  theme_minimal() + 
+  scale_color_manual(values = dataset_colors) + 
+  scale_y_log10()
+
+(p1 + p2 + p3) + plot_layout(ncol = 1, guides = "collect") & theme(legend.position = "bottom")
+```
+
+## Error Analysis {.tabset .tabset-fade}
+
+
+```{r, echo=FALSE, results='asis'}
+
+List_of_sample_in_red <- c("C069864", "K063382-R1", "K063425-R1", "K063434-R1", "ST06933714H", "C067581_S32", "C067580_S31", "C067583_S34", "C070253", "C070878", "C070343", "C070877", "C070887")
+
+create_fn_fp_tables <- function(dataset_name) {
+  ds_results <- all_results[[dataset_name]]
+  
+  process_samples <- function(sample_list, type, metric) {
+    if (is.null(sample_list) || length(sample_list) == 0) {
+      cat(paste0("\n#### No ", type, " Samples found for ", metric, " metric\n"))
+      return(invisible(NULL))
+    }
+    
+    all_samples <- tibble()
+    already_seen <- tibble(sample_id = character(), Pathogen = character())
+
+    for (thresh in names(sample_list)) {
+      current <- sample_list[[thresh]]
+      if (is.null(current) || nrow(current) == 0) next
+      
+      current <- current %>% mutate(Threshold = thresh)
+      new_samples <- anti_join(current, already_seen, by = c("sample_id", "Pathogen"))
+      already_seen <- bind_rows(already_seen, new_samples %>% select(sample_id, Pathogen))
+      
+      if (nrow(new_samples) > 0) {
+        enriched <- new_samples %>%
+          mutate(Metric = metric)
+        
+        all_samples <- bind_rows(all_samples, enriched)
+      }
+    }
+
+    if (nrow(all_samples) > 0) {
+      cat(paste0("\n#### ", type, " Samples (", metric, ")\n"))
+      
+      # Define column order
+      preferred_order <- c("sample_id", "Pathogen", "PCR_Result", "SEQ_Result", "Threshold", 
+                          "coverage_percentage", "rpm", "depth_of_coverage", "ct_values")
+      
+      # Create the table
+      table_data <- all_samples %>% 
+        select(any_of(preferred_order)) %>% 
+        arrange(Threshold, Pathogen, sample_id)
+      
+      # Create kable object
+      kable_obj <- kable(table_data,
+                        caption = paste(type, "samples for", dataset_name, "(", metric, ")")) %>% 
+        kable_styling()
+      
+      # Apply red color to sample IDs that are in the predefined list
+      if (length(List_of_sample_in_red) > 0) {
+        error_rows <- which(table_data$sample_id %in% List_of_sample_in_red)
+        if (length(error_rows) > 0) {
+          kable_obj <- kable_obj %>%
+            row_spec(error_rows, color = "red", bold = TRUE)
+        }
+      }
+      
+      print(kable_obj)
+      
+    } else {
+      cat(paste0("\n#### No ", type, " Samples found for ", metric, " metric\n"))
+    }
+  }
+  
+  # Process metrics
+  if (!is.null(ds_results$coverage)) {
+    process_samples(ds_results$coverage$fn_samples, "False Negatives", "coverage")
+    process_samples(ds_results$coverage$fp_samples, "False Positives", "coverage")
+  }
+  
+  if (!is.null(ds_results$rpm)) {
+    process_samples(ds_results$rpm$fn_samples, "False Negatives", "rpm")
+    process_samples(ds_results$rpm$fp_samples, "False Positives", "rpm")
+  }
+}
+
+
+```
+
+### Dataset 1: Pathcare
+
+```{r, echo=FALSE, results='asis'}
+
+if ("PathCare" %in% names(loaded_datasets)) {
+  create_fn_fp_tables("PathCare")
+}
+```
+
+### Dataset 2: NHLS GS 
+
+```{r, echo=FALSE, results='asis'}
+if ("NHLS_GS" %in% names(loaded_datasets)) {
+  create_fn_fp_tables("NHLS_GS")
+}
+```
+
+### Dataset 3: NHLS TY
+
+```{r, echo=FALSE, results='asis'}
+if ("NHLS_TY" %in% names(loaded_datasets)) {
+  create_fn_fp_tables("NHLS_TY")
+}
+```
+
+### Dataset 4: Muco
+
+```{r, echo=FALSE, results='asis'}
+if ("Mucokids" %in% names(loaded_datasets)) {
+  create_fn_fp_tables("Mucokids")
+}
+```
+
+### Dataset 5: SUDI
+
+```{r, echo=FALSE, results='asis'}
+if ("SUDI" %in% names(loaded_datasets)) {
+  create_fn_fp_tables("SUDI")
+}
+```
+
+### Dataset 6: All Samples
+
+```{r, echo=FALSE, results='asis'}
+if ("ALL_COMBINED" %in% names(loaded_datasets)) {
+  create_fn_fp_tables("ALL_COMBINED")
+}
+```
+
+
+## Comprehensive Contamination-Adjusted Error Analysis
+
+```{r, echo=FALSE, results='asis', fig.height=6, fig.width=17}
+# Function to create contamination-adjusted FP/FN tables - SHOWING ONLY CONTAM-ADJUSTED ERRORS
+create_contam_adjusted_fn_fp_tables <- function(dataset_name) {
+  ds_results <- all_results[[dataset_name]]
+  
+  if (is.null(ds_results)) {
+    cat("No results found for dataset:", dataset_name, "\n")
+    return(invisible(NULL))
+  }
+  
+  # Process coverage
+  if (!is.null(ds_results$coverage)) {
+    cat("\n#### Coverage Thresholds\n\n")
+    
+    # Get thresholds from coverage results
+    thresholds <- c("cov10", "cov20", "cov50", "cov80", "cov90")
+    threshold_values <- c(10, 20, 50, 80, 90)
+    
+    for (i in seq_along(thresholds)) {
+      thresh <- thresholds[i]
+      thresh_val <- threshold_values[i]
+      
+      fp_samples <- ds_results$coverage$fp_samples[[thresh]]
+      fn_samples <- ds_results$coverage$fn_samples[[thresh]]
+      
+      # Get contamination-adjusted FP (only those NOT contaminated)
+      if (!is.null(fp_samples) && nrow(fp_samples) > 0) {
+        fp_adj <- fp_samples %>%
+          filter(Contam != "YES") %>%
+          select(-Contam)  # Remove Contam column since all are "NO"
+        
+        if (nrow(fp_adj) > 0) {
+          cat(paste0("\n**Threshold = ", thresh_val, "% - False Positives (Contamination-Adjusted):** ", nrow(fp_adj), " samples\n\n"))
+          
+          fp_display <- fp_adj %>%
+            select(sample_id, Pathogen, PCR_Result, SEQ_Result, 
+                   coverage_percentage, rpm, depth_of_coverage, ct_values) %>%
+            arrange(Pathogen, sample_id)
+          
+          kable(fp_display,
+                caption = paste("False Positives - Contam Adj (", dataset_name, ", ", thresh_val, "%)", sep = "")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            print()
+        }
+      }
+      
+      # Get contamination-adjusted FN (only those NOT contaminated)
+      if (!is.null(fn_samples) && nrow(fn_samples) > 0) {
+        fn_adj <- fn_samples %>%
+          filter(Contam != "YES") %>%
+          select(-Contam)  # Remove Contam column since all are "NO"
+        
+        if (nrow(fn_adj) > 0) {
+          cat(paste0("\n**Threshold = ", thresh_val, "% - False Negatives (Contamination-Adjusted):** ", nrow(fn_adj), " samples\n\n"))
+          
+          fn_display <- fn_adj %>%
+            select(sample_id, Pathogen, PCR_Result, SEQ_Result, 
+                   coverage_percentage, rpm, depth_of_coverage, ct_values) %>%
+            arrange(Pathogen, sample_id)
+          
+          kable(fn_display,
+                caption = paste("False Negatives - Contam Adj (", dataset_name, ", ", thresh_val, "%)", sep = "")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            print()
+        }
+      }
+      
+      cat("\n---\n\n")
+    }
+  }
+  
+  # Process RPM
+  if (!is.null(ds_results$rpm)) {
+    cat("\n#### RPM Thresholds\n\n")
+    
+    thresholds <- c("rpm1", "rpm10", "rpm100", "rpm1000")
+    threshold_values <- c(1, 10, 100, 1000)
+    
+    for (i in seq_along(thresholds)) {
+      thresh <- thresholds[i]
+      thresh_val <- threshold_values[i]
+      
+      fp_samples <- ds_results$rpm$fp_samples[[thresh]]
+      fn_samples <- ds_results$rpm$fn_samples[[thresh]]
+      
+      # Get contamination-adjusted FP (only those NOT contaminated)
+      if (!is.null(fp_samples) && nrow(fp_samples) > 0) {
+        fp_adj <- fp_samples %>%
+          filter(Contam != "YES") %>%
+          select(-Contam)
+        
+        if (nrow(fp_adj) > 0) {
+          cat(paste0("\n**Threshold = ", thresh_val, " RPM - False Positives (Contamination-Adjusted):** ", nrow(fp_adj), " samples\n\n"))
+          
+          fp_display <- fp_adj %>%
+            select(sample_id, Pathogen, PCR_Result, SEQ_Result, 
+                   coverage_percentage, rpm, depth_of_coverage, ct_values) %>%
+            arrange(Pathogen, sample_id)
+          
+          kable(fp_display,
+                caption = paste("False Positives - Contam Adj (", dataset_name, ", ", thresh_val, " RPM)", sep = "")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            print()
+        }
+      }
+      
+      # Get contamination-adjusted FN (only those NOT contaminated)
+      if (!is.null(fn_samples) && nrow(fn_samples) > 0) {
+        fn_adj <- fn_samples %>%
+          filter(Contam != "YES") %>%
+          select(-Contam)
+        
+        if (nrow(fn_adj) > 0) {
+          cat(paste0("\n**Threshold = ", thresh_val, " RPM - False Negatives (Contamination-Adjusted):** ", nrow(fn_adj), " samples\n\n"))
+          
+          fn_display <- fn_adj %>%
+            select(sample_id, Pathogen, PCR_Result, SEQ_Result, 
+                   coverage_percentage, rpm, depth_of_coverage, ct_values) %>%
+            arrange(Pathogen, sample_id)
+          
+          kable(fn_display,
+                caption = paste("False Negatives - Contam Adj (", dataset_name, ", ", thresh_val, " RPM)", sep = "")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            print()
+        }
+      }
+      
+      cat("\n---\n\n")
+    }
+  }
+  
+  # Process Depth
+  if (!is.null(ds_results$depth)) {
+    cat("\n#### Depth Thresholds\n\n")
+    
+    thresholds <- c("depth10", "depth30")
+    threshold_values <- c(10, 30)
+    
+    for (i in seq_along(thresholds)) {
+      thresh <- thresholds[i]
+      thresh_val <- threshold_values[i]
+      
+      fp_samples <- ds_results$depth$fp_samples[[thresh]]
+      fn_samples <- ds_results$depth$fn_samples[[thresh]]
+      
+      # Get contamination-adjusted FP (only those NOT contaminated)
+      if (!is.null(fp_samples) && nrow(fp_samples) > 0) {
+        fp_adj <- fp_samples %>%
+          filter(Contam != "YES") %>%
+          select(-Contam)
+        
+        if (nrow(fp_adj) > 0) {
+          cat(paste0("\n**Threshold = ", thresh_val, " Depth - False Positives (Contamination-Adjusted):** ", nrow(fp_adj), " samples\n\n"))
+          
+          fp_display <- fp_adj %>%
+            select(sample_id, Pathogen, PCR_Result, SEQ_Result, 
+                   coverage_percentage, rpm, depth_of_coverage, ct_values) %>%
+            arrange(Pathogen, sample_id)
+          
+          kable(fp_display,
+                caption = paste("False Positives - Contam Adj (", dataset_name, ", ", thresh_val, " Depth)", sep = "")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            print()
+        }
+      }
+      
+      # Get contamination-adjusted FN (only those NOT contaminated)
+      if (!is.null(fn_samples) && nrow(fn_samples) > 0) {
+        fn_adj <- fn_samples %>%
+          filter(Contam != "YES") %>%
+          select(-Contam)
+        
+        if (nrow(fn_adj) > 0) {
+          cat(paste0("\n**Threshold = ", thresh_val, " Depth - False Negatives (Contamination-Adjusted):** ", nrow(fn_adj), " samples\n\n"))
+          
+          fn_display <- fn_adj %>%
+            select(sample_id, Pathogen, PCR_Result, SEQ_Result, 
+                   coverage_percentage, rpm, depth_of_coverage, ct_values) %>%
+            arrange(Pathogen, sample_id)
+          
+          kable(fn_display,
+                caption = paste("False Negatives - Contam Adj (", dataset_name, ", ", thresh_val, " Depth)", sep = "")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            print()
+        }
+      }
+      
+      cat("\n---\n\n")
+    }
+  }
+}
+
+# For ALL_COMBINED with original dataset column
+create_contam_adjusted_fn_fp_tables_combined <- function(dataset_name) {
+  ds_results <- all_results[[dataset_name]]
+  ds <- loaded_datasets[[dataset_name]]
+  
+  if (is.null(ds_results)) {
+    cat("No results found for dataset:", dataset_name, "\n")
+    return(invisible(NULL))
+  }
+  
+  # Process coverage
+  if (!is.null(ds_results$coverage)) {
+    cat("\n#### Coverage Thresholds\n\n")
+    
+    thresholds <- c("cov10", "cov20", "cov50", "cov80", "cov90")
+    threshold_values <- c(10, 20, 50, 80, 90)
+    
+    for (i in seq_along(thresholds)) {
+      thresh <- thresholds[i]
+      thresh_val <- threshold_values[i]
+      
+      fp_samples <- ds_results$coverage$fp_samples[[thresh]]
+      fn_samples <- ds_results$coverage$fn_samples[[thresh]]
+      
+      if (!is.null(fp_samples) && nrow(fp_samples) > 0) {
+        fp_adj <- fp_samples %>%
+          filter(Contam != "YES") %>%
+          select(-Contam)
+        
+        if (nrow(fp_adj) > 0) {
+          cat(paste0("\n**Threshold = ", thresh_val, "% - False Positives (Contamination-Adjusted):** ", nrow(fp_adj), " samples\n\n"))
+          
+          # Join with PCR data to get original_dataset
+          fp_display <- fp_adj %>%
+            left_join(ds$pcr %>% select(sample_id, Pathogen, original_dataset), 
+                      by = c("sample_id", "Pathogen")) %>%
+            select(original_dataset, sample_id, Pathogen, PCR_Result, SEQ_Result, 
+                   coverage_percentage, rpm, depth_of_coverage, ct_values) %>%
+            arrange(original_dataset, Pathogen, sample_id)
+          
+          kable(fp_display,
+                caption = paste("False Positives - Contam Adj (", dataset_name, ", ", thresh_val, "%)", sep = "")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            print()
+        }
+      }
+      
+      if (!is.null(fn_samples) && nrow(fn_samples) > 0) {
+        fn_adj <- fn_samples %>%
+          filter(Contam != "YES") %>%
+          select(-Contam)
+        
+        if (nrow(fn_adj) > 0) {
+          cat(paste0("\n**Threshold = ", thresh_val, "% - False Negatives (Contamination-Adjusted):** ", nrow(fn_adj), " samples\n\n"))
+          
+          # Join with PCR data to get original_dataset
+          fn_display <- fn_adj %>%
+            left_join(ds$pcr %>% select(sample_id, Pathogen, original_dataset), 
+                      by = c("sample_id", "Pathogen")) %>%
+            select(original_dataset, sample_id, Pathogen, PCR_Result, SEQ_Result, 
+                   coverage_percentage, rpm, depth_of_coverage, ct_values) %>%
+            arrange(original_dataset, Pathogen, sample_id)
+          
+          kable(fn_display,
+                caption = paste("False Negatives - Contam Adj (", dataset_name, ", ", thresh_val, "%)", sep = "")) %>%
+            kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+            print()
+        }
+      }
+      
+      cat("\n---\n\n")
+    }
+  }
+}
+
+# Contamination-Adjusted Error Analysis
+for (ds_name in names(loaded_datasets)) {
+  if (ds_name == "ALL_COMBINED") {
+    create_contam_adjusted_fn_fp_tables_combined(ds_name)
+  } else {
+    create_contam_adjusted_fn_fp_tables(ds_name)
+  }
+}
+
+for (ds_name in names(loaded_datasets)) {
+  cat(paste0("\n### ", ds_name, "\n\n"))
+  create_contam_adjusted_fn_fp_tables(ds_name)
+}
+```
+
+## Contamination-Adjusted Confusion Matrices {.tabset .tabset-fade .tabset-pills}
+
+### PathCare
+```{r, echo=FALSE, results='asis'}
+display_contam_adjusted_confusion("PathCare")
+```
+### NHLS_GS
+```{r, echo=FALSE, results='asis'}
+display_contam_adjusted_confusion("NHLS_GS")
+```
+### NHLS_TY
+```{r, echo=FALSE, results='asis'}
+display_contam_adjusted_confusion("NHLS_TY")
+```
+### Muco-kids
+```{r, echo=FALSE, results='asis'}
+display_contam_adjusted_confusion("Mucokids")
+```
+### SUDI
+```{r, echo=FALSE, results='asis'}
+display_contam_adjusted_confusion("SUDI")
+```
+### all
+```{r, echo=FALSE, results='asis'}
+display_contam_adjusted_confusion("ALL_COMBINED")
+```
+
+```{r, echo=FALSE, results='asis'}
+# Enhanced summary table function that accounts for Contam = YES
+create_contamination_adjusted_summary_table <- function() {
+  summary_list <- list()
+  
+  # Load the reads data file (same as original)
+  if (file.exists(reads_file)) {
+    reads_data <- read_csv(reads_file, show_col_types = FALSE)
+    
+    # Standardize column names
+    if ("fileName" %in% colnames(reads_data)) {
+      reads_data <- reads_data %>% rename(sample_id = fileName)
+    }
+    if ("totalReads" %in% colnames(reads_data)) {
+      reads_data <- reads_data %>% rename(total_reads = totalReads)
+    }
+    
+    if (!"sample_id" %in% colnames(reads_data)) {
+      possible_id_cols <- c("sample", "Sample", "SampleID", "sampleID", "id", "ID")
+      for (col in possible_id_cols) {
+        if (col %in% colnames(reads_data)) {
+          reads_data <- reads_data %>% rename(sample_id = all_of(col))
+          break
+        }
+      }
+    }
+  } else {
+    warning("Reads file not found at: ", reads_file)
+    reads_data <- NULL
+  }
+  
+  # Update dataset names to include combined ones
+  all_dataset_names <- c("PathCare", "NHLS_GS", "NHLS_TY", "Mucokids", "SUDI", "ALL_COMBINED")
+  
+  for (ds_name in all_dataset_names) {
+    if (!ds_name %in% names(loaded_datasets)) next
+    
+    ds <- loaded_datasets[[ds_name]]
+    
+    # 1. Number of samples in sampleset
+    num_samples <- length(unique(ds$continuous$sample_id))
+    
+    # 2. Number of positive PCR detections
+    pcr_detections <- ds$pcr %>%
+      filter(PCR_Result == 1) %>%
+      nrow()
+    
+    # 3. Number of contaminated samples/observations
+    # Count unique samples with contamination
+    contaminated_samples <- ds$continuous %>%
+      filter(Contam == "YES") %>%
+      distinct(sample_id) %>%
+      nrow()
+    
+    contaminated_observations <- ds$continuous %>%
+      filter(Contam == "YES") %>%
+      nrow()
+    
+    # 4. Reads per sample, median (IQR) - from reads file
+    read_stats <- "N/A"
+    if (!is.null(reads_data) && "sample_id" %in% colnames(reads_data) && 
+        "total_reads" %in% colnames(reads_data)) {
+      
+      ds_samples <- unique(ds$continuous$sample_id)
+      dataset_reads <- reads_data %>%
+        filter(sample_id %in% ds_samples) %>%
+        pull(total_reads)
+      
+      if (length(dataset_reads) > 0 && !all(is.na(dataset_reads))) {
+        median_reads <- median(dataset_reads, na.rm = TRUE)
+        q1_reads <- quantile(dataset_reads, 0.25, na.rm = TRUE)
+        q3_reads <- quantile(dataset_reads, 0.75, na.rm = TRUE)
+        read_stats <- sprintf("%.0f (%.0f-%.0f)", 
+                             median_reads, q1_reads, q3_reads)
+      }
+    }
+    
+    # 5. Sensitivity at 10% genome coverage (ORIGINAL - without contamination adjustment)
+    sensitivity_10_original <- NA
+    specificity_10_original <- NA
+    
+    if (!is.null(all_results[[ds_name]]$coverage$results)) {
+      cov10_results <- all_results[[ds_name]]$coverage$results %>%
+        filter(Threshold == "cov10")
+      
+      if (nrow(cov10_results) > 0) {
+        sensitivity_10_original <- cov10_results$Sensitivity[1]
+        specificity_10_original <- cov10_results$Specificity[1]
+      }
+    }
+    
+    # 6. Sensitivity at 10% genome coverage (CONTAMINATION-ADJUSTED)
+    sensitivity_10_contam <- NA
+    specificity_10_contam <- NA
+    
+    if (!is.null(all_results[[ds_name]]$coverage$results_contam)) {
+      cov10_results_contam <- all_results[[ds_name]]$coverage$results_contam %>%
+        filter(Threshold == "cov10")
+      
+      if (nrow(cov10_results_contam) > 0) {
+        sensitivity_10_contam <- cov10_results_contam$Sensitivity[1]
+        specificity_10_contam <- cov10_results_contam$Specificity[1]
+      }
+    }
+    
+    # 7. Sequencing success (genome coverage >80%, depth >10) - ORIGINAL
+    sequencing_success_original <- inner_join(ds$pcr, ds$continuous,
+                                    by = c("sample_id", "Pathogen")) %>%
+      filter(PCR_Result == 1) %>%
+      summarise(
+        success = sum(coverage_percentage >= 80 & depth_of_coverage >= 10, na.rm = TRUE),
+        total = n(),
+        percent = ifelse(total > 0, round(success / total * 100, 1), 0)
+      )
+    
+    sequencing_success_original_str <- if (sequencing_success_original$total > 0) {
+      sprintf("%d/%d (%.1f%%)", 
+              sequencing_success_original$success, 
+              sequencing_success_original$total, 
+              sequencing_success_original$percent)
+    } else {
+      "N/A"
+    }
+    
+    # 8. Sequencing success (genome coverage >80%, depth >10) - CONTAMINATION-ADJUSTED
+    # Exclude contaminated samples
+    sequencing_success_contam <- inner_join(ds$pcr, ds$continuous,
+                                    by = c("sample_id", "Pathogen")) %>%
+      filter(PCR_Result == 1 & Contam == "NO") %>%
+      summarise(
+        success = sum(coverage_percentage >= 80 & depth_of_coverage >= 10, na.rm = TRUE),
+        total = n(),
+        percent = ifelse(total > 0, round(success / total * 100, 1), 0)
+      )
+    
+    sequencing_success_contam_str <- if (sequencing_success_contam$total > 0) {
+      sprintf("%d/%d (%.3f%%)", 
+              sequencing_success_contam$success, 
+              sequencing_success_contam$total, 
+              sequencing_success_contam$percent)
+    } else {
+      "N/A"
+    }
+    
+    # 9. Sequencing success for pathogens at Ct values <30 - ORIGINAL
+    ct_success_original <- inner_join(ds$pcr, ds$continuous,
+                            by = c("sample_id", "Pathogen")) %>%
+      filter(PCR_Result == 1 & !is.na(ct_values) & ct_values < 30 & ct_values > 0) %>%
+      summarise(
+        success = sum(coverage_percentage >= 0.1, na.rm = TRUE),
+        total = n(),
+        percent = ifelse(total > 0, round(success / total * 100, 1), 0)
+      )
+    
+    ct_success_original_str <- if (ct_success_original$total > 0) {
+      sprintf("%d/%d (%.3f%%)", 
+              ct_success_original$success, 
+              ct_success_original$total, 
+              ct_success_original$percent)
+    } else {
+      "N/A"
+    }
+    
+    # 10. Sequencing success for pathogens at Ct values <30 - CONTAMINATION-ADJUSTED
+    ct_success_contam <- inner_join(ds$pcr, ds$continuous,
+                            by = c("sample_id", "Pathogen")) %>%
+      filter(PCR_Result == 1 & Contam == "NO" & !is.na(ct_values) & ct_values < 30 & ct_values > 0) %>%
+      summarise(
+        success = sum(coverage_percentage >= 0.1, na.rm = TRUE),
+        total = n(),
+        percent = ifelse(total > 0, round(success / total * 100, 1), 0)
+      )
+    
+    ct_success_contam_str <- if (ct_success_contam$total > 0) {
+      sprintf("%d/%d (%.3f%%)", 
+              ct_success_contam$success, 
+              ct_success_contam$total, 
+              ct_success_contam$percent)
+    } else {
+      "N/A"
+    }
+    
+    # 11. Ct < 30 Sensitivity at 10% coverage (ORIGINAL) - FOR ALL DATASETS
+ct30_sensitivity_original <- NA
+ct30_data_orig <- inner_join(ds$pcr, ds$continuous, by = c("sample_id", "Pathogen")) %>%
+  filter(!is.na(PCR_Result), !is.na(ct_values), ct_values < 30, ct_values > 0) %>%
+  mutate(SEQ_Result = ifelse(coverage_percentage >= 10, 1, 0))
+
+TP_ct30_orig <- sum(ct30_data_orig$PCR_Result == 1 & ct30_data_orig$SEQ_Result == 1, na.rm = TRUE)
+FN_ct30_orig <- sum(ct30_data_orig$PCR_Result == 1 & ct30_data_orig$SEQ_Result == 0, na.rm = TRUE)
+ct30_sensitivity_original <- ifelse((TP_ct30_orig + FN_ct30_orig) > 0, 
+                                    TP_ct30_orig / (TP_ct30_orig + FN_ct30_orig), NA_real_)
+
+# 12. Ct < 30 Sensitivity at 10% coverage (CONTAMINATION-ADJUSTED) - FOR ALL DATASETS
+ct30_sensitivity_contam <- NA
+ct30_data_contam <- inner_join(ds$pcr, ds$continuous, by = c("sample_id", "Pathogen")) %>%
+  filter(!is.na(PCR_Result), !is.na(ct_values), ct_values < 30, ct_values > 0) %>%
+  mutate(SEQ_Result = case_when(
+    Contam == "YES" ~ 0,
+    coverage_percentage >= 10 ~ 1,
+    TRUE ~ 0
+  ))
+
+TP_ct30_contam <- sum(ct30_data_contam$PCR_Result == 1 & ct30_data_contam$SEQ_Result == 1, na.rm = TRUE)
+FN_ct30_contam <- sum(ct30_data_contam$PCR_Result == 1 & ct30_data_contam$SEQ_Result == 0, na.rm = TRUE)
+ct30_sensitivity_contam <- ifelse((TP_ct30_contam + FN_ct30_contam) > 0, 
+                                  TP_ct30_contam / (TP_ct30_contam + FN_ct30_contam), NA_real_)
+
+    
+    # Store summary with all requested metrics (including contamination stats)
+    summary_list[[ds_name]] <- c(
+      "Number of samples" = as.character(num_samples),
+      "Positive PCR detections" = as.character(pcr_detections),
+      "Contaminated samples" = as.character(contaminated_samples),
+      "Contaminated observations" = as.character(contaminated_observations),
+      "Reads per sample, median (IQR)" = read_stats,
+      "Sensitivity at 10% (Original)" = ifelse(!is.na(sensitivity_10_original), 
+                                                    paste0(round(sensitivity_10_original * 100, 1), "%"), 
+                                                    "N/A"),
+      "Specificity at 10% (Original)" = ifelse(!is.na(specificity_10_original), 
+                                                    paste0(round(specificity_10_original * 100, 1), "%"), 
+                                                    "N/A"),
+      "Sensitivity at 10% (Contam Adj)" = ifelse(!is.na(sensitivity_10_contam), 
+                                                    paste0(round(sensitivity_10_contam * 100, 1), "%"), 
+                                                    "N/A"),
+      "Specificity at 10% (Contam Adj)" = ifelse(!is.na(specificity_10_contam), 
+                                                    paste0(round(specificity_10_contam * 100, 1), "%"), 
+                                                    "N/A"),
+      "Sequencing success (Original)" = sequencing_success_original_str,
+      "Sequencing success (Contam Adj)" = sequencing_success_contam_str,
+      "Ct <30 success (Original)" = ct_success_original_str,
+      "Ct <30 success (Contam Adj)" = ct_success_contam_str,
+      # Add these to the summary_list[[ds_name]] assignment
+"Ct <30 Sensitivity (Original)" = ifelse(!is.na(ct30_sensitivity_original), 
+                                         paste0(round(ct30_sensitivity_original * 100, 1), "%"), 
+                                         "N/A"),
+"Ct <30 Sensitivity (Contam Adj)" = ifelse(!is.na(ct30_sensitivity_contam), 
+                                           paste0(round(ct30_sensitivity_contam * 100, 1), "%"), 
+                                           "N/A")
+    )
+  }
+  
+  # Create summary data frame
+  summary_df <- as.data.frame(do.call(cbind, summary_list))
+  
+  # Add row names as first column
+  summary_df <- cbind(
+    data.frame(Metric = rownames(summary_df)),
+    summary_df
+  )
+  rownames(summary_df) <- NULL
+  
+  return(summary_df)
+}
+
+# Generate the contamination-adjusted summary table
+contamination_adj_summary <- create_contamination_adjusted_summary_table()
+
+# Display the table
+if (!is.null(contamination_adj_summary)) {
+  cat("\n## Contamination-Adjusted Summary Table\n\n")
+  kable(contamination_adj_summary, 
+        caption = "Dataset Summary Comparison (with Contamination Adjustment)", 
+        row.names = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), 
+                  full_width = FALSE, font_size = 12) %>%
+    column_spec(1, bold = TRUE, width = "25em") %>%
+    scroll_box(width = "100%", height = "500px")
+}
+```
+
+## PCR Positive Counts by Pathogen
+
+```{r, echo=FALSE, results='asis'}
+
+cat("Number of PCR positive detections for each pathogen across datasets.\n\n")
+
+display_pcr_positive_counts()
+display_pcr_positive_counts("PathCare")
+display_pcr_positive_counts("NHLS_GS")
+display_pcr_positive_counts("NHLS_TY")
+display_pcr_positive_counts("Mucokids")
+display_pcr_positive_counts("SUDI")
+```
+
+## PCR Positive Samples Summary
+
+```{r, echo=FALSE, results='asis'}
+# Get PCR positive samples data
+pcr_results <- get_pcr_positive_samples()
+
+if (!is.null(pcr_results) && length(pcr_results) > 0) {
+  
+  # Create summary table
+  summary_df <- map_dfr(pcr_results, function(x) {
+    tibble(
+      Dataset = x$dataset,
+      Total_Samples = x$total_samples,
+      PCR_Positive_Samples = x$positive_samples_count,
+      Percent_Positive = paste0(x$percent_positive, "%"),
+      Total_Detections = x$total_detections
+    )
+  })
+  
+  cat("\n### Summary of PCR Positive Samples by Dataset\n\n")
+  
+  kable(summary_df, 
+        caption = "Number of Samples with PCR Positive Detections",
+        col.names = c("Dataset", "Total Samples", "Samples with PCR+", "% Positive", "Total Detections")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+    column_spec(1, bold = TRUE) %>%
+    row_spec(which(summary_df$Dataset == "ALL_COMBINED"), background = "#FFF3CD", bold = TRUE) %>%
+    print()
+}
+```
+
+
+## Sequencing Strategy Table
+```{r, echo=FALSE, results='asis'}
+
+# Load strategy data
+strategy_file <- "./Strat_data.xlsx"
+strategy_data <- read_excel(strategy_file)
+
+# Function to calculate Clopper-Pearson 95% CI
+calc_clopper_pearson_ci <- function(x, n, conf_level = 0.95) {
+  if (n == 0) return(c(NA, NA))
+  if (x == 0) {
+    lower <- 0
+    upper <- 1 - (1 - conf_level)^(1/n)
+  } else if (x == n) {
+    lower <- (1 - conf_level)^(1/n)
+    upper <- 1
+  } else {
+    alpha <- 1 - conf_level
+    lower <- qbeta(alpha/2, x, n - x + 1)
+    upper <- qbeta(1 - alpha/2, x + 1, n - x)
+  }
+  return(c(lower, upper))
+}
+
+# Function to calculate strategy-based metrics (CONTAMINATION-ADJUSTED)
+calculate_strategy_metrics_contam_adj <- function() {
+  
+  # Load strategy data
+  strategy_file <- "./Strat_data.xlsx"
+  strategy_data <- read_excel(strategy_file)
+  
+  # Get unique strategies
+  strategies <- unique(strategy_data$Strategy)
+  strategies <- strategies[order(strategies)]  # Sort
+  
+  # Initialize results list
+  results <- list()
+  
+  for (strat in strategies) {
+    # Get samples for this strategy
+    strat_samples <- strategy_data %>%
+      filter(Strategy == strat) %>%
+      pull(sample_id)
+    
+    # Combine all datasets to get full data
+    all_pcr <- bind_rows(lapply(names(loaded_datasets), function(ds_name) {
+      if (ds_name != "ALL_COMBINED") {
+        loaded_datasets[[ds_name]]$pcr %>% mutate(Dataset = ds_name)
+      }
+    }))
+    
+    all_continuous <- bind_rows(lapply(names(loaded_datasets), function(ds_name) {
+      if (ds_name != "ALL_COMBINED") {
+        loaded_datasets[[ds_name]]$continuous %>% mutate(Dataset = ds_name)
+      }
+    }))
+    
+    # Filter to strategy samples
+    pcr_strat <- all_pcr %>% filter(sample_id %in% strat_samples)
+    cont_strat <- all_continuous %>% filter(sample_id %in% strat_samples)
+    
+    # Merge data
+    merged_data <- inner_join(pcr_strat, cont_strat, by = c("sample_id", "Pathogen", "Dataset"))
+    
+    # 1. Median sequencing depth (reads per sample)
+    reads_stats <- "N/A"
+    if (file.exists(reads_file)) {
+      reads_data <- read_csv(reads_file, show_col_types = FALSE)
+      
+      if ("fileName" %in% colnames(reads_data)) {
+        reads_data <- reads_data %>% rename(sample_id = fileName)
+      }
+      if ("totalReads" %in% colnames(reads_data)) {
+        reads_data <- reads_data %>% rename(total_reads = totalReads)
+      }
+      
+      if (!"sample_id" %in% colnames(reads_data)) {
+        possible_id_cols <- c("sample", "Sample", "SampleID", "sampleID", "id", "ID")
+        for (col in possible_id_cols) {
+          if (col %in% colnames(reads_data)) {
+            reads_data <- reads_data %>% rename(sample_id = all_of(col))
+            break
+          }
+        }
+      }
+      
+      # Filter to strategy samples
+      strat_reads <- reads_data %>%
+        filter(sample_id %in% strat_samples) %>%
+        pull(total_reads)
+      
+      if (length(strat_reads) > 0 && !all(is.na(strat_reads))) {
+        median_reads <- median(strat_reads, na.rm = TRUE)
+        q1_reads <- quantile(strat_reads, 0.25, na.rm = TRUE)
+        q3_reads <- quantile(strat_reads, 0.75, na.rm = TRUE)
+        reads_stats <- sprintf("%.0f (%.0f - %.0f)", 
+                               median_reads, q1_reads, q3_reads)
+      }
+    }
+    
+    # 2. Specificity at 10% coverage (CONTAMINATION-ADJUSTED)
+    seq_data <- merged_data %>%
+      filter(!is.na(PCR_Result)) %>%
+      mutate(SEQ_Result = ifelse(coverage_percentage >= 10, 1, 0)) %>%
+      mutate(SEQ_Result_Adj = case_when(
+        Contam == "YES" ~ 0,
+        TRUE ~ SEQ_Result
+      ))
+    
+    # Use contamination-adjusted SEQ_Result
+    TP <- sum(seq_data$PCR_Result == 1 & seq_data$SEQ_Result_Adj == 1, na.rm = TRUE)
+    TN <- sum(seq_data$PCR_Result == 0 & seq_data$SEQ_Result_Adj == 0, na.rm = TRUE)
+    FP <- sum(seq_data$PCR_Result == 0 & seq_data$SEQ_Result_Adj == 1, na.rm = TRUE)
+    FN <- sum(seq_data$PCR_Result == 1 & seq_data$SEQ_Result_Adj == 0, na.rm = TRUE)
+    
+    specificity <- ifelse((TN + FP) > 0, TN / (TN + FP), NA_real_)
+    sensitivity <- ifelse((TP + FN) > 0, TP / (TP + FN), NA_real_)
+    
+    # Calculate 95% CI using Clopper-Pearson
+    spec_ci <- calc_clopper_pearson_ci(TN, TN + FP)
+    sens_ci <- calc_clopper_pearson_ci(TP, TP + FN)
+    
+    specificity_str <- sprintf("%.1f%% (%.1f%% - %.1f%%)", 
+                               specificity * 100, spec_ci[1] * 100, spec_ci[2] * 100)
+    sensitivity_str <- sprintf("%.1f%% (%.1f%% - %.1f%%)", 
+                               sensitivity * 100, sens_ci[1] * 100, sens_ci[2] * 100)
+    
+    # 3. Sensitivity for Ct < 30 (CONTAMINATION-ADJUSTED)
+    ct30_data <- merged_data %>%
+      filter(!is.na(PCR_Result), !is.na(ct_values), ct_values < 30, ct_values > 0) %>%
+      mutate(SEQ_Result = ifelse(coverage_percentage >= 10, 1, 0)) %>%
+      mutate(SEQ_Result_Adj = case_when(
+        Contam == "YES" ~ 0,
+        TRUE ~ SEQ_Result
+      ))
+    
+    TP_ct30 <- sum(ct30_data$PCR_Result == 1 & ct30_data$SEQ_Result_Adj == 1, na.rm = TRUE)
+    FN_ct30 <- sum(ct30_data$PCR_Result == 1 & ct30_data$SEQ_Result_Adj == 0, na.rm = TRUE)
+    
+    sensitivity_ct30 <- ifelse((TP_ct30 + FN_ct30) > 0, TP_ct30 / (TP_ct30 + FN_ct30), NA_real_)
+    sens_ct30_ci <- calc_clopper_pearson_ci(TP_ct30, TP_ct30 + FN_ct30)
+    
+    sensitivity_ct30_str <- sprintf("%.1f%% (%.1f%% - %.1f%%)", 
+                                    sensitivity_ct30 * 100, sens_ct30_ci[1] * 100, sens_ct30_ci[2] * 100)
+    
+    # Store results
+    results[[strat]] <- list(
+      Reads = reads_stats,
+      Specificity = specificity_str,
+      Sensitivity = sensitivity_str,
+      Sensitivity_Ct30 = sensitivity_ct30_str,
+      # Store raw values for debugging
+      n_samples = length(strat_samples),
+      n_obs = nrow(merged_data),
+      TP = TP, FN = FN, FP = FP, TN = TN,
+      TP_ct30 = TP_ct30, FN_ct30 = FN_ct30
+    )
+  }
+  
+  # Calculate ALL strategies combined
+  # Get all samples from all strategies
+  all_samples <- strategy_data %>%
+    pull(sample_id)
+  
+  # Combine all datasets to get full data
+  all_pcr <- bind_rows(lapply(names(loaded_datasets), function(ds_name) {
+    if (ds_name != "ALL_COMBINED") {
+      loaded_datasets[[ds_name]]$pcr %>% mutate(Dataset = ds_name)
+    }
+  }))
+  
+  all_continuous <- bind_rows(lapply(names(loaded_datasets), function(ds_name) {
+    if (ds_name != "ALL_COMBINED") {
+      loaded_datasets[[ds_name]]$continuous %>% mutate(Dataset = ds_name)
+    }
+  }))
+  
+  # Filter to all samples
+  pcr_all <- all_pcr %>% filter(sample_id %in% all_samples)
+  cont_all <- all_continuous %>% filter(sample_id %in% all_samples)
+  
+  # Merge data
+  merged_all <- inner_join(pcr_all, cont_all, by = c("sample_id", "Pathogen", "Dataset"))
+  
+  # 1. Median sequencing depth for ALL (reads per sample)
+  reads_all_stats <- "N/A"
+  if (file.exists(reads_file)) {
+    reads_data <- read_csv(reads_file, show_col_types = FALSE)
+    
+    if ("fileName" %in% colnames(reads_data)) {
+      reads_data <- reads_data %>% rename(sample_id = fileName)
+    }
+    if ("totalReads" %in% colnames(reads_data)) {
+      reads_data <- reads_data %>% rename(total_reads = totalReads)
+    }
+    
+    if (!"sample_id" %in% colnames(reads_data)) {
+      possible_id_cols <- c("sample", "Sample", "SampleID", "sampleID", "id", "ID")
+      for (col in possible_id_cols) {
+        if (col %in% colnames(reads_data)) {
+          reads_data <- reads_data %>% rename(sample_id = all_of(col))
+          break
+        }
+      }
+    }
+    
+    # Filter to all samples
+    all_reads <- reads_data %>%
+      filter(sample_id %in% all_samples) %>%
+      pull(total_reads)
+    
+    if (length(all_reads) > 0 && !all(is.na(all_reads))) {
+      median_reads_all <- median(all_reads, na.rm = TRUE)
+      q1_reads_all <- quantile(all_reads, 0.25, na.rm = TRUE)
+      q3_reads_all <- quantile(all_reads, 0.75, na.rm = TRUE)
+      reads_all_stats <- sprintf("%.0f (%.0f - %.0f)", 
+                                 median_reads_all, q1_reads_all, q3_reads_all)
+    }
+  }
+  
+  # 2. Specificity for ALL (CONTAMINATION-ADJUSTED)
+  seq_all_data <- merged_all %>%
+    filter(!is.na(PCR_Result)) %>%
+    mutate(SEQ_Result = ifelse(coverage_percentage >= 10, 1, 0)) %>%
+    mutate(SEQ_Result_Adj = case_when(
+      Contam == "YES" ~ 0,
+      TRUE ~ SEQ_Result
+    ))
+  
+  TP_all <- sum(seq_all_data$PCR_Result == 1 & seq_all_data$SEQ_Result_Adj == 1, na.rm = TRUE)
+  TN_all <- sum(seq_all_data$PCR_Result == 0 & seq_all_data$SEQ_Result_Adj == 0, na.rm = TRUE)
+  FP_all <- sum(seq_all_data$PCR_Result == 0 & seq_all_data$SEQ_Result_Adj == 1, na.rm = TRUE)
+  FN_all <- sum(seq_all_data$PCR_Result == 1 & seq_all_data$SEQ_Result_Adj == 0, na.rm = TRUE)
+  
+  specificity_all <- ifelse((TN_all + FP_all) > 0, TN_all / (TN_all + FP_all), NA_real_)
+  sensitivity_all <- ifelse((TP_all + FN_all) > 0, TP_all / (TP_all + FN_all), NA_real_)
+  
+  spec_all_ci <- calc_clopper_pearson_ci(TN_all, TN_all + FP_all)
+  sens_all_ci <- calc_clopper_pearson_ci(TP_all, TP_all + FN_all)
+  
+  specificity_all_str <- sprintf("%.1f%% (%.1f%% - %.1f%%)", 
+                                 specificity_all * 100, spec_all_ci[1] * 100, spec_all_ci[2] * 100)
+  sensitivity_all_str <- sprintf("%.1f%% (%.1f%% - %.1f%%)", 
+                                 sensitivity_all * 100, sens_all_ci[1] * 100, sens_all_ci[2] * 100)
+  
+  # 3. Sensitivity for Ct < 30 for ALL (CONTAMINATION-ADJUSTED)
+  ct30_all_data <- merged_all %>%
+    filter(!is.na(PCR_Result), !is.na(ct_values), ct_values < 30, ct_values > 0) %>%
+    mutate(SEQ_Result = ifelse(coverage_percentage >= 10, 1, 0)) %>%
+    mutate(SEQ_Result_Adj = case_when(
+      Contam == "YES" ~ 0,
+      TRUE ~ SEQ_Result
+    ))
+  
+  TP_ct30_all <- sum(ct30_all_data$PCR_Result == 1 & ct30_all_data$SEQ_Result_Adj == 1, na.rm = TRUE)
+  FN_ct30_all <- sum(ct30_all_data$PCR_Result == 1 & ct30_all_data$SEQ_Result_Adj == 0, na.rm = TRUE)
+  
+  sensitivity_ct30_all <- ifelse((TP_ct30_all + FN_ct30_all) > 0, TP_ct30_all / (TP_ct30_all + FN_ct30_all), NA_real_)
+  sens_ct30_all_ci <- calc_clopper_pearson_ci(TP_ct30_all, TP_ct30_all + FN_ct30_all)
+  
+  sensitivity_ct30_all_str <- sprintf("%.1f%% (%.1f%% - %.1f%%)", 
+                                      sensitivity_ct30_all * 100, sens_ct30_all_ci[1] * 100, sens_ct30_all_ci[2] * 100)
+  
+  # Add ALL results
+  results[["ALL"]] <- list(
+    Reads = reads_all_stats,
+    Specificity = specificity_all_str,
+    Sensitivity = sensitivity_all_str,
+    Sensitivity_Ct30 = sensitivity_ct30_all_str,
+    n_samples = length(all_samples),
+    n_obs = nrow(merged_all),
+    TP = TP_all, FN = FN_all, FP = FP_all, TN = TN_all,
+    TP_ct30 = TP_ct30_all, FN_ct30 = FN_ct30_all
+  )
+  
+  return(results)
+}
+
+# Function to display strategy summary table (CONTAMINATION-ADJUSTED)
+display_strategy_summary_contam_adj <- function() {
+  
+  results <- calculate_strategy_metrics_contam_adj()
+  
+  # Define the order of strategies (matching your example)
+  strategy_order <- c("48_P2", "96_P2", "60_P1", "96_P1", "24-V3", "ALL")
+  
+  # Create table
+  table_data <- tibble(
+    Metric = c(
+      "Median sequencing depth, reads per sample (IQR)",
+      "Specificity (95% CI)",
+      "Sensitivity (95% CI)",
+      "Sensitivity for pathogens detected with Ct value <30 (95% CI)"
+    )
+  )
+  
+  # Add each strategy in the specified order
+  for (strat in strategy_order) {
+    if (strat %in% names(results)) {
+      table_data[[strat]] <- c(
+        results[[strat]]$Reads,
+        results[[strat]]$Specificity,
+        results[[strat]]$Sensitivity,
+        results[[strat]]$Sensitivity_Ct30
+      )
+    } else {
+      table_data[[strat]] <- c("N/A", "N/A", "N/A", "N/A")
+    }
+  }
+  
+  return(table_data)
+}
+
+# Function to display strategy summary in a formatted kable table
+display_strategy_summary_table_contam_adj <- function() {
+  
+  table_data <- display_strategy_summary_contam_adj()
+  
+  # Add header row with strategy names and formatting
+  kable(table_data, 
+        caption = "Performance Metrics by Sequencing Strategy (Contamination-Adjusted)",
+        escape = FALSE) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+    column_spec(1, bold = TRUE, width = "30em") %>%
+    row_spec(0, bold = TRUE, background = "#E8E8E8") %>%
+    row_spec(nrow(table_data), bold = TRUE, background = "#F0F0F0") %>%  # Bold the ALL row
+    add_header_above(c(" " = 1, "Sequencing Strategy" = (ncol(table_data) - 1))) %>%
+    print()
+}
+
+# Strategy-Based Summary Table (Contamination-Adjusted)
+
+cat("\n### Strategy-Based Performance Summary (Contamination-Adjusted)\n\n")
+cat("Performance metrics stratified by sequencing strategy.\n")
+cat("**Note:** All metrics calculated using contamination-adjusted results (samples with Contam = YES were set to negative).\n")
+cat("**CI:** 95% Clopper-Pearson confidence intervals.\n\n")
+
+display_strategy_summary_table_contam_adj()
+```

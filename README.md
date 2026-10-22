@@ -1,6 +1,6 @@
 # Implementation of VirCapSeq-VERT Metagenomic Surveillance for Respiratory Viruses in South Africa
 
-This repository contains the code and de-identified metadata used for the analyses presented in the manuscript:
+This repository contains the code and metadata used for the analyses presented in the manuscript:
 
 > **Implementation of hybridisation capture metagenomic surveillance for respiratory viruses in South Africa**
 
@@ -25,7 +25,7 @@ Human-read-removed FASTQ files are publicly available from the NCBI Sequence Rea
 
 **BioProject:** PRJNA1455986
 
-Consensus genome sequences have been submitted to GISAID (accession numbers provided in Supplementary Table X).
+Consensus genome sequences have been submitted to GISAID.
 Only de-identified metadata required to reproduce the analyses is included in this repository.
 
 ## Reproducing the Analysis

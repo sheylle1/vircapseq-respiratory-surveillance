@@ -50,5 +50,5 @@ p_boxplot <- analysis_ready %>%
 
 
 # Save the boxplot
-ggsave("figures/Supfig1.png", plot = p_boxplot, width = 10, height = 6,  dpi = 300)
-ggsave("figures/Supfig1.pdf", plot = p_boxplot, width = 10, height = 6)
+ggsave("results/Figures/Figure1C.png", plot = p_boxplot, width = 10, height = 6,  dpi = 300)
+ggsave("results/Figures/Figure1C.pdf", plot = p_boxplot, width = 10, height = 6)

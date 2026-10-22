@@ -1,13 +1,12 @@
 #!/usr/bin/env Rscript
-
 library(tidyverse)
 library(readxl)
 library(patchwork)
 library(cowplot)
 library(RColorBrewer)
 library(scales)
-
-# --- Helper functions --------------------------------------------------
+library(grid)
+library(svglite)
 
 convert_detected <- function(x) {
   dplyr::case_when(
@@ -37,19 +36,18 @@ load_metadata <- function(metadata_file) {
     mutate(
       totalReads_clean = as.numeric(gsub(",", "", totalReads)),
       total_reads_category = case_when(
-        totalReads_clean < 100000 ~ "<100K",
-        totalReads_clean >= 100000 & totalReads_clean < 500000 ~ "100K-500K",
-        totalReads_clean >= 500000 & totalReads_clean < 1000000 ~ "500K-1M",
+        totalReads_clean < 100000  ~ "<100K",
+        totalReads_clean >= 100000  & totalReads_clean < 500000  ~ "100K-500K",
+        totalReads_clean >= 500000  & totalReads_clean < 1000000 ~ "500K-1M",
         totalReads_clean >= 1000000 & totalReads_clean < 2000000 ~ "1M-2M",
         totalReads_clean >= 2000000 & totalReads_clean < 5000000 ~ "2M-5M",
         totalReads_clean >= 5000000 & totalReads_clean < 10000000 ~ "5M-10M",
-        totalReads_clean >= 10000000 ~ ">10M",
+        totalReads_clean >= 10000000  ~ ">10M",
         TRUE ~ NA_character_
       )
     )
   
   read_categories <- c("<100K", "100K-500K", "500K-1M", "1M-2M", "2M-5M", "5M-10M", ">10M")
-  
   list(metadata = metadata, read_categories = read_categories)
 }
 
@@ -59,21 +57,19 @@ create_ct_figure <- function(main_data, metadata_info, output_dir) {
     left_join(metadata_info$metadata, by = "sample_id") %>%
     filter(!is.na(ct_values) & ct_values > 0) %>%
     mutate(
-      Ct_bin = cut(ct_values, 
-                   breaks = c(-Inf, 20, 25, 30, 35, Inf),
-                   labels = c("Ct <20", "Ct 20-25", "Ct 25-30", "Ct 30-35", "Ct >35")),
-      total_reads_category = factor(total_reads_category, 
-                                    levels = metadata_info$read_categories)
+      Ct_bin = cut(ct_values, breaks = c(-Inf, 20, 25, 30, 35, Inf), labels = c("Ct <20", "Ct 20-25", "Ct 25-30", "Ct 30-35", "Ct >35")),
+      total_reads_category = factor(total_reads_category, levels = metadata_info$read_categories)
     ) %>%
     filter(!is.na(total_reads_category)) %>%
     mutate(
-      depth_of_coverage = ifelse(depth_of_coverage == 0 & Contam != "YES", 0.1, depth_of_coverage),
-      coverage_percentage = ifelse(coverage_percentage == 0 & Contam != "YES", 0.1, coverage_percentage),
-      is_zero_point = (depth_of_coverage == 0.1 & coverage_percentage == 0.1),
+      depth_of_coverage = ifelse(depth_of_coverage    == 0 & Contam != "YES", 0.1, depth_of_coverage),
+      coverage_percentage  = ifelse(coverage_percentage  == 0 & Contam != "YES", 0.1, coverage_percentage),
+      is_zero_point  = (depth_of_coverage == 0.1 & coverage_percentage == 0.1),
       is_contam_point = (Contam == "YES")
-    )
+    ) %>%
+    filter(!is_contam_point)
   
-  max_depth_global <- max(all_data$depth_of_coverage[all_data$depth_of_coverage > 0.1], na.rm = TRUE)
+  max_depth_global  <- max(all_data$depth_of_coverage[all_data$depth_of_coverage > 0.1], na.rm = TRUE)
   xmax_box_global <- max_depth_global * 1.35
   
   if (max_depth_global > 100000) {
@@ -90,16 +86,10 @@ create_ct_figure <- function(main_data, metadata_info, output_dir) {
     axis_labels <- c("0", "1", "10", "100", "1K")
   }
   
-  red_box_data <- tibble(
-    xmin = 10,
-    xmax = xmax_box_global,
-    ymin = 80,
-    ymax = 105
-  )
+  red_box_data <- tibble(xmin = 10, xmax = xmax_box_global, ymin = 80, ymax = 105)
   
   all_data <- all_data %>%
-    mutate(Pathogen = ifelse(Pathogen == "Enterovirus / Rhinovirus (HRV)",
-                             "Rhinovirus (HRV)", Pathogen))
+    mutate(Pathogen = ifelse(Pathogen == "Enterovirus / Rhinovirus (HRV)", "Rhinovirus (HRV)", Pathogen))
   
   pathogens <- sort(unique(all_data$Pathogen))
   
@@ -107,8 +97,7 @@ create_ct_figure <- function(main_data, metadata_info, output_dir) {
     "#E2C044", "#cd7cac", "#72b043", "#F46036",
     "#D7263D", "#662E9B", "#0D3B66", "#2EC4B6"
   )
-  
-  pathogen_colors <- bold_palette[1:length(pathogens)]
+  pathogen_colors  <- bold_palette[1:length(pathogens)]
   names(pathogen_colors) <- pathogens
   
   zero_point_counts <- all_data %>%
@@ -120,14 +109,12 @@ create_ct_figure <- function(main_data, metadata_info, output_dir) {
     left_join(zero_point_counts, by = c("total_reads_category", "Ct_bin")) %>%
     mutate(
       zero_point_count = replace_na(zero_point_count, 0),
-      point_color = ifelse(is_zero_point & Contam != "YES" & zero_point_count >= 2, 
-                           "gray50", Pathogen)
+      point_color = ifelse(is_zero_point & Contam != "YES" & zero_point_count >= 2, "gray50", Pathogen)
     )
   
   row_counts <- all_data %>%
     group_by(total_reads_category) %>%
     summarise(row_n = n(), .groups = 'drop')
-  
   col_counts <- all_data %>%
     group_by(Ct_bin) %>%
     summarise(col_n = n(), .groups = 'drop')
@@ -144,7 +131,6 @@ create_ct_figure <- function(main_data, metadata_info, output_dir) {
     all_data$total_reads_category_label,
     levels = unique(all_data$total_reads_category_label[order(all_data$total_reads_category)])
   )
-  
   all_data$Ct_bin_label <- factor(
     all_data$Ct_bin_label,
     levels = unique(all_data$Ct_bin_label[order(all_data$Ct_bin)])
@@ -156,84 +142,115 @@ create_ct_figure <- function(main_data, metadata_info, output_dir) {
     summarise(count = n(), .groups = 'drop') %>%
     filter(count >= 1)
   
+  # ── Core ggplot ──────────────────────────────────────────────────────────
   p <- ggplot(all_data, aes(x = depth_of_coverage, y = coverage_percentage)) +
-    geom_rect(data = red_box_data,
-              aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax), 
-              color = "red", fill = NA, linewidth = 0.3,
-              inherit.aes = FALSE) +
+    geom_rect(data = red_box_data,  aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+              color = "red", fill = NA, linewidth = 0.3, inherit.aes = FALSE) +
     geom_hline(yintercept = 10, linetype = "dashed", color = "grey50", linewidth = 0.6) +
-    geom_point(data = subset(all_data, !is_contam_point),
-               aes(color = point_color), alpha = 0.7, size = 1.2) +
-    geom_point(data = subset(all_data, is_contam_point),
-               aes(fill = point_color),
-               color = "red", size = 2.0, stroke = 0.45,
-               shape = 21, alpha = 0.9) +
+    geom_point(data = subset(all_data, !is_contam_point), aes(color = point_color), alpha = 0.7, size = 1.2) +
     geom_text(data = point_counts,
               aes(x = 0.1, y = 0.1, label = paste0("n=", count)),
-              color = "black", size = 3.2, 
+              color = "black", size = 3.2,
               vjust = -0.35, hjust = 0.4,
-              inherit.aes = FALSE,
-              check_overlap = FALSE) +
-    facet_grid(total_reads_category_label ~ Ct_bin_label, 
-               scales = "fixed", space = "fixed") +
-    scale_fill_manual(values = c(pathogen_colors, "gray50" = "gray50"), 
-                      name = "Pathogen Detected",
-                      breaks = names(pathogen_colors),
-                      na.value = "grey50",
-                      guide = "none") +
-    scale_color_manual(values = c(pathogen_colors, "gray50" = "gray50"), 
-                       name = "Pathogen Detected",
-                       breaks = names(pathogen_colors),
+              inherit.aes = FALSE, check_overlap = FALSE) +
+    facet_grid(total_reads_category_label ~ Ct_bin_label, scales = "fixed", space = "fixed") +
+    scale_fill_manual(values  = c(pathogen_colors, "gray50" = "gray50"),
+                      name    = "Pathogen Detected",
+                      breaks  = names(pathogen_colors),
+                      na.value = "grey50", guide = "none") +
+    scale_color_manual(values  = c(pathogen_colors, "gray50" = "gray50"),
+                       name    = "Pathogen Detected",
+                       breaks  = names(pathogen_colors),
                        na.value = "grey50") +
     scale_y_continuous(labels = percent_format(scale = 1), limits = c(0, 105)) +
-    scale_x_log10(breaks = axis_breaks, labels = axis_labels, limits = c(0.09, xmax_box_global)) +
+    scale_x_log10(breaks = axis_breaks, labels = axis_labels,
+                  limits = c(0.09, xmax_box_global)) +
     labs(x = "Depth of coverage", y = "Genome coverage (%)") +
     theme_minimal(base_size = 12) +
     theme(
       plot.title = element_blank(),
       axis.title = element_text(size = 12, face = "bold", vjust = -0.4),
-      axis.text = element_text(size = 10),
+      axis.text  = element_text(size = 10),
       axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
       axis.text.y = element_text(size = 7),
       strip.text = element_text(size = 8, face = "bold"),
       strip.text.y = element_text(size = 8, face = "bold"),
       strip.background = element_rect(color = "black", fill = "grey95", linewidth = 0.5),
-      panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5),
-      panel.spacing = unit(0.02, "lines"),
+      panel.border  = element_rect(color = "black", fill = NA,  linewidth = 0.5),
+      panel.spacing  = unit(0.02, "lines"),
       panel.grid.minor = element_blank(),
-      legend.position = "bottom",
-      legend.text = element_text(size = 10),
+      legend.position  = "bottom",
+      legend.text= element_text(size = 10),
       legend.title = element_text(size = 11, face = "bold"),
       legend.box.margin = margin(t = 15, b = 10),
       legend.background = element_rect(fill = "white", color = "white", linewidth = 0.5),
-      plot.margin = margin(20, 10, 20, 10)
+      # Extra top & right margin to make room for outer header blocks
+      plot.margin      = margin(40, 60, 20, 10)
     ) +
-    guides(color = guide_legend(nrow = 2, byrow = TRUE, override.aes = list(size = 4)))
+    guides(color = guide_legend(nrow = 2, byrow = TRUE,
+                                override.aes = list(size = 4)))
   
-  ggsave(filename = file.path(output_dir, "Figure4.png"), plot = p,
+  # ── Add outer header blocks via cowplot::ggdraw ───────────────────────────
+  final <- ggdraw(p) +
+    # Top header: "Ct value buckets"
+    draw_grob(
+      rectGrob(
+        x = 0.52, y = 0.978,          # x centre, y centre in [0,1] npc
+        width  = 0.78,                 # spans the facet columns
+        height = 0.032,                # block height — increase to make taller
+        gp = gpar(fill = "grey92", col = "black", lwd = 1)
+      )
+    ) +
+    draw_label(
+      "Viral abundance",
+      x = 0.52, y = 0.978,
+      hjust = 0.5, vjust = 0.5,
+      fontface = "bold", size = 11
+    ) +
+    # Right sidebar: "Sequencing depth buckets"
+    draw_grob(
+      rectGrob(
+        x = 0.978, y = 0.52,          # x centre, y centre
+        width  = 0.032,                # block width — increase to make wider
+        height = 0.72,                 # spans the facet rows
+        gp = gpar(fill = "grey92", col = "black", lwd = 1)
+      )
+    ) +
+    draw_label(
+      "Sequencing depth (total reads per sample)",
+      x = 0.978, y = 0.52,
+      hjust = 0.5, vjust = 0.5,
+      angle = 270,
+      fontface = "bold", size = 11
+    )
+  
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+  
+  ggsave(filename = file.path(output_dir, "Figure4.png"),
+         plot = final,
          width = 9, height = 11, dpi = 300, bg = "white", limitsize = FALSE)
-  ggsave(filename = file.path(output_dir, "Figure4.pdf"), plot = p,
-         width = 9, height = 11, device = cairo_pdf, bg = "white", limitsize = FALSE)
+  ggsave(filename = file.path(output_dir, "Figure4.pdf"),
+         plot = final,
+         width = 9, height = 11, device = cairo_pdf, bg = "white",
+         limitsize = FALSE)
+  ggsave(filename = file.path(output_dir, "Figure4.svg"),
+         plot = final,
+         width = 9, height = 11, device = svglite::svglite, bg = "white",
+         limitsize = FALSE)
   
-  return(list(plot = p, data = all_data))
+  return(list(plot = final, data = all_data))
 }
 
-output_dir <- "figures"
-if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
-
+# ── Run ───────────────────────────────────────────────────────────────────────
+output_dir    <- "results/Figures"
 metadata_file <- "data/processed/data_reads.csv"
-if (file.exists(metadata_file)) {
-  metadata_info <- load_metadata(metadata_file)
-} else {
-  stop("Metadata file not found: ", metadata_file)
-}
+main_file     <- "data/processed/data_meta.csv"
 
-main_file <- "data/processed/data_meta.csv"
-if (file.exists(main_file)) {
-  main_data <- prepare_main_data(main_file)
-} else {
-  stop("Main data file not found: ", main_file)
-}
+if (!file.exists(metadata_file)) stop("Metadata file not found: ", metadata_file)
+if (!file.exists(main_file))     stop("Main data file not found: ", main_file)
+
+metadata_info <- load_metadata(metadata_file)
+main_data     <- prepare_main_data(main_file)
 
 if (nrow(main_data) > 0) {
   results <- create_ct_figure(main_data, metadata_info, output_dir)
